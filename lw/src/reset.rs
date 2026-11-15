@@ -3,7 +3,8 @@
 //! Accepted: `get_usage`'s ISO UTC (`2026-11-15T23:30:00.194Z`), any RFC 3339 time, and limit text such as
 //! `You've hit your 5-hour limit · resets 3:40am (America/Los_Angeles)`, `resets 3:45pm`, `resets Mon 12:00am`,
 //! `resets Nov 17, 10am`, `resets in 4h 25m`. Without a zone in brackets a clock time is local.
-//! A clock time earlier than now is tomorrow; a weekday is its next occurrence; a month and day earlier than now is next year.
+//! A time, weekday or month and day that has already passed means its next occurrence, unless it passed less than
+//! `LATE_NOTICE_HOURS` ago (a notice read late): then it is that recent one.
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Timelike, Utc, Weekday};
 use serde_json::{Value, json};
 
@@ -35,16 +36,22 @@ pub fn whole_seconds(t: DateTime<Utc>) -> DateTime<Utc> {
     t - Duration::nanoseconds(i64::from(t.timestamp_subsec_nanos()))
 }
 
-/// `t` plus `minutes`, rounded up to a whole minute, then one minute on if it lands on :00 or :30 local time
-/// (one-shots on those minutes can fire up to 90 seconds early).
+/// `t` plus `minutes`, rounded up to a whole minute, then moved on a minute at a time while it lands on :00 or :30 local time
+/// (one-shots on those minutes can fire up to 90 seconds early) or inside the hour that clocks going back repeat
+/// (its cron line would name two times): 01:14 on the fall-back night becomes 02:01.
 pub fn later(t: DateTime<Utc>, minutes: i64, zone: &Zone) -> DateTime<Utc> {
     let mut x = whole_seconds(t) + Duration::minutes(minutes);
     if x.second() != 0 {
         x = x - Duration::seconds(i64::from(x.second())) + Duration::minutes(1);
     }
-    let m = zone.fix(x).minute();
-    if m == 0 || m == 30 {
-        x += Duration::minutes(1);
+    // A repeated period is at most a few hours; the bound only guards against a broken zone table.
+    for _ in 0..(6 * 60) {
+        let m = zone.fix(x).minute();
+        if m == 0 || m == 30 || zone.ambiguous(x) {
+            x += Duration::minutes(1);
+        } else {
+            break;
+        }
     }
     x
 }
@@ -157,23 +164,32 @@ pub fn parse_reset(text: &str, ctx: &Ctx) -> Result<DateTime<Utc>, String> {
     }
     let time = time.ok_or_else(|| format!("no clock time in {original:?}"))?;
     let today = zone.naive(ctx.now).date();
-    let at = |date: NaiveDate| zone.resolve(date.and_time(time)).ok_or_else(|| format!("{date} {time} does not exist in that zone"));
-    if let Some((m, d)) = month_day {
-        let date = NaiveDate::from_ymd_opt(today.year(), m, d).ok_or_else(|| format!("no such date in {original:?}"))?;
-        let t = at(date)?;
-        if t >= ctx.now {
-            return Ok(t);
-        }
-        let next = NaiveDate::from_ymd_opt(today.year() + 1, m, d).ok_or_else(|| format!("no such date in {original:?}"))?;
-        return at(next);
+    let dates: Vec<NaiveDate> = if let Some((m, d)) = month_day {
+        (-1..=1).filter_map(|dy| NaiveDate::from_ymd_opt(today.year() + dy, m, d)).collect()
+    } else if let Some(w) = weekday {
+        (-7..=7).map(|k| today + Duration::days(k)).filter(|d| d.weekday() == w).collect()
+    } else {
+        (-1..=1).map(|k| today + Duration::days(k)).collect()
+    };
+    if dates.is_empty() {
+        return Err(format!("no such date in {original:?}"));
     }
-    if let Some(w) = weekday {
-        let ahead = (7 + i64::from(w.num_days_from_monday()) - i64::from(today.weekday().num_days_from_monday())) % 7;
-        let t = at(today + Duration::days(ahead))?;
-        return if t >= ctx.now { Ok(t) } else { at(today + Duration::days(ahead + 7)) };
+    let times: Vec<DateTime<Utc>> = dates.iter().filter_map(|d| zone.resolve(d.and_time(time))).collect();
+    nearest(&times, ctx.now).ok_or_else(|| format!("{time} does not exist in that zone"))
+}
+
+/// A notice can be read a little after the reset it names ("resets 3:30pm" handled at 15:34). Of the occurrences of a time,
+/// the latest one at or before now wins if it was less than this many hours ago; otherwise the next one.
+pub const LATE_NOTICE_HOURS: i64 = 6;
+
+fn nearest(times: &[DateTime<Utc>], now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let past = times.iter().copied().filter(|t| *t <= now).max();
+    let next = times.iter().copied().filter(|t| *t > now).min();
+    match (past, next) {
+        (Some(p), _) if now - p < Duration::hours(LATE_NOTICE_HOURS) => Some(p),
+        (_, Some(n)) => Some(n),
+        (p, None) => p,
     }
-    let t = at(today)?;
-    if t >= ctx.now { Ok(t) } else { at(today + Duration::days(1)) }
 }
 
 const WEEKDAYS: [(&str, Weekday); 7] = [
@@ -343,11 +359,47 @@ mod tests {
     }
 
     #[test]
-    fn a_clock_time_earlier_than_now_is_tomorrow_across_midnight() {
+    fn a_clock_time_long_past_is_tomorrow_across_midnight() {
         assert_eq!(parse("resets 12:10am", "2026-11-15T23:50:00-08:00"), "2026-11-16T00:10:00-08:00");
-        assert_eq!(parse("resets 3:45pm", "2026-11-15T16:00:00-08:00"), "2026-11-16T15:45:00-08:00");
+        // 3:45am was 6 h 15 min ago: the next one
+        assert_eq!(parse("resets 3:45am", "2026-11-15T10:00:00-08:00"), "2026-11-16T03:45:00-08:00");
         // month and year roll over too
         assert_eq!(parse("resets 12:05am", "2026-12-31T23:59:00-08:00"), "2027-01-01T00:05:00-08:00");
+    }
+
+    #[test]
+    fn a_notice_read_late_keeps_the_reset_it_names() {
+        // the finding: "resets 3:30pm" handled at 15:34 is today's 15:30, not tomorrow's
+        assert_eq!(parse("You've hit your 5-hour limit \u{b7} resets 3:30pm", "2026-11-15T15:34:00-08:00"), "2026-11-15T15:30:00-08:00");
+        assert_eq!(parse("resets 3:45pm", "2026-11-15T16:00:00-08:00"), "2026-11-15T15:45:00-08:00");
+        // 5 h 59 min ago still counts; across midnight it is yesterday's
+        assert_eq!(parse("resets 4:01am", "2026-11-15T10:00:00-08:00"), "2026-11-15T04:01:00-08:00");
+        assert_eq!(parse("resets 11:50pm", "2026-11-16T00:10:00-08:00"), "2026-11-15T23:50:00-08:00");
+        // a weekday that passed minutes ago, and a month and day
+        assert_eq!(parse("resets Sun 3pm", "2026-11-15T15:20:00-08:00"), "2026-11-15T15:00:00-08:00");
+        assert_eq!(parse("Weekly limit reached \u{2219} resets Nov 15, 2pm", "2026-11-15T15:20:00-08:00"), "2026-11-15T14:00:00-08:00");
+        assert_eq!(parse("resets Dec 31 11pm", "2027-01-01T00:30:00-08:00"), "2026-12-31T23:00:00-08:00");
+        // the wake for a reset already gone is 2 minutes from now
+        let ctx = ctx_at("2026-11-15T15:34:00-08:00");
+        let s = schedule(parse_reset("resets 3:30pm", &ctx).unwrap(), &ctx);
+        assert_eq!(local(&ctx, s.wake_at), "2026-11-15T15:36:00-08:00");
+    }
+
+    #[test]
+    fn a_wake_in_the_repeated_hour_moves_past_it() {
+        // 2026-11-01 in Los Angeles: 01:00-01:59 happens twice (PDT, then PST); a cron line there would name two times
+        for (reset, now) in [("2026-11-01T01:10:00-07:00", "2026-11-01T00:30:00-07:00"), ("2026-11-01T01:10:00-08:00", "2026-11-01T01:05:00-08:00")] {
+            let ctx = ctx_at(now);
+            let s = schedule(clock::parse_instant(reset, &la()).unwrap(), &ctx);
+            assert_eq!(local(&ctx, s.wake_at), "2026-11-01T02:01:00-08:00", "{reset}");
+            assert_eq!(ctx.cron(s.wake_at), "1 2 1 11 *");
+            assert_eq!(local(&ctx, s.backup_at), "2026-11-01T02:06:00-08:00", "{reset}");
+        }
+        // a wake just before the repeated hour stays; its backup inside it moves
+        let ctx = ctx_at("2026-11-01T00:00:00-07:00");
+        let s = schedule(clock::parse_instant("2026-11-01T00:52:00-07:00", &la()).unwrap(), &ctx);
+        assert_eq!(local(&ctx, s.wake_at), "2026-11-01T00:56:00-07:00");
+        assert_eq!(local(&ctx, s.backup_at), "2026-11-01T02:01:00-08:00");
     }
 
     #[test]

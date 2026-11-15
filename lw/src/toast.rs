@@ -1,5 +1,5 @@
 //! The one place that shows a Windows toast or touches the registry key that lets lw's toasts appear.
-//! Adapted from the JBOD suite's and inbox-ledger's toast channel (WinRT ToastNotificationManager, no PowerShell).
+//! Uses WinRT's ToastNotificationManager directly (no PowerShell).
 //!
 //! Windows shows toasts only for a registered app id. `lw toast-setup` writes the per-user key
 //! `HKCU\Software\Classes\AppUserModelId\LimitWatchdog.lw` (no admin); `lw toast-setup --remove` deletes it.

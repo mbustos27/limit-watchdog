@@ -97,16 +97,75 @@ fn arm_json(action: &str, w: &Wake, ctx: &Ctx, deleted: Vec<String>) -> Value {
 
 // ---------------------------------------------------------------------------------------------------------------- agents
 
-pub struct NewAgent {
-    pub id: String,
-    pub name: String,
-    pub agent_type: String,
-    pub kind: Kind,
-    pub risk: Risk,
+/// The fields of `add` and `edit`. `None` is "not given on the command line"; an empty path clears that field.
+#[derive(Default)]
+pub struct Fields {
+    pub name: Option<String>,
+    pub agent_type: Option<String>,
+    pub kind: Option<Kind>,
+    pub risk: Option<Risk>,
     pub worktree: Option<String>,
     pub handoff: Option<String>,
     pub brief_file: Option<String>,
     pub resume: Option<String>,
+}
+
+pub struct NewAgent {
+    pub id: String,
+    /// `--replaces OLD_ID`: a re-dispatch of that agent.
+    pub replaces: Option<String>,
+    pub fields: Fields,
+}
+
+fn nonempty(s: Option<String>) -> Option<String> {
+    s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Explore and Plan are always `redispatch`; the note says so when that overrides the kind asked for.
+fn forced_kind(agent_type: &str, kind: Kind) -> (Kind, Value) {
+    if always_redispatch(agent_type) && kind != Kind::Redispatch {
+        (Kind::Redispatch, json!(format!("{} agents cannot be resumed by id: kind set to redispatch", agent_type.trim())))
+    } else {
+        (kind, Value::Null)
+    }
+}
+
+/// `base` with the given fields laid over it. A resume text that was the default for the old handoff follows a new handoff.
+fn overlay(base: &Agent, f: Fields) -> Result<(Agent, Value), String> {
+    let mut a = base.clone();
+    if let Some(n) = f.name {
+        a.name = n.trim().to_string();
+    }
+    if a.name.is_empty() {
+        return Err("--name is empty".into());
+    }
+    if let Some(t) = f.agent_type {
+        a.agent_type = t.trim().to_string();
+    }
+    if let Some(k) = f.kind {
+        a.kind = k;
+    }
+    if let Some(r) = f.risk {
+        a.risk = r;
+    }
+    if f.worktree.is_some() {
+        a.worktree = nonempty(f.worktree);
+    }
+    if f.handoff.is_some() {
+        a.handoff = nonempty(f.handoff);
+    }
+    if f.brief_file.is_some() {
+        a.brief_file = nonempty(f.brief_file);
+    }
+    a.resume = match (f.resume, &base.resume) {
+        (Some(r), _) if !r.trim().is_empty() => r.trim().to_string(),
+        (Some(_), _) => default_resume(a.handoff.as_deref()),
+        (None, old) if old.trim().is_empty() || *old == default_resume(base.handoff.as_deref()) => default_resume(a.handoff.as_deref()),
+        (None, old) => old.clone(),
+    };
+    let (kind, note) = forced_kind(&a.agent_type, a.kind);
+    a.kind = kind;
+    Ok((a, note))
 }
 
 pub fn add(l: &mut Ledger, ctx: &Ctx, a: NewAgent) -> Out {
@@ -116,38 +175,77 @@ pub fn add(l: &mut Ledger, ctx: &Ctx, a: NewAgent) -> Out {
     if l.agent(&a.id).is_some() {
         return Err(format!("agent {} is already in the ledger", a.id));
     }
-    if a.name.trim().is_empty() {
-        return Err("--name is empty".into());
+    let old = match a.replaces.as_deref().map(str::trim) {
+        Some(r) => Some(l.agent(r).cloned().ok_or_else(|| format!("--replaces: no agent {r:?} in the ledger"))?),
+        None => None,
+    };
+    let f = a.fields;
+    // A new agent starts from nothing (every required field given); a re-dispatch starts from the old agent, keeping its
+    // resume count and last resume so the per-agent cap and the herd guard still see them.
+    let base = match &old {
+        Some(o) => Agent { id: a.id.clone(), state: State::Running, last_failure: None, ..o.clone() },
+        None => {
+            let need = |v: &Option<String>, k: &str| v.as_ref().map(|_| ()).ok_or_else(|| format!("{k} is required"));
+            need(&f.name, "--name")?;
+            need(&f.agent_type, "--agent-type")?;
+            Agent {
+                id: a.id.clone(),
+                name: String::new(),
+                agent_type: String::new(),
+                kind: f.kind.ok_or("--kind is required")?,
+                risk: f.risk.ok_or("--risk is required")?,
+                worktree: None,
+                handoff: None,
+                brief_file: None,
+                state: State::Running,
+                resumes_tonight: 0,
+                last_resumed: None,
+                prev_resumed: None,
+                last_failure: None,
+                resume: String::new(),
+            }
+        }
+    };
+    let (agent, note) = overlay(&base, f)?;
+    match &old {
+        Some(o) => log(
+            l,
+            ctx,
+            format!(
+                "added {} ({}): {} {} {}, replacing {} (resumed {} time(s) tonight)",
+                agent.id,
+                agent.name,
+                agent.agent_type,
+                word(&agent.kind),
+                word(&agent.risk),
+                o.id,
+                agent.resumes_tonight
+            ),
+        ),
+        None => log(l, ctx, format!("added {} ({}): {} {} {}", agent.id, agent.name, agent.agent_type, word(&agent.kind), word(&agent.risk))),
     }
-    let mut note = Value::Null;
-    let kind = if always_redispatch(&a.agent_type) && a.kind != Kind::Redispatch {
-        note = json!(format!("{} agents cannot be resumed by id: kind set to redispatch", a.agent_type.trim()));
-        Kind::Redispatch
-    } else {
-        a.kind
-    };
-    let nonempty = |s: Option<String>| s.filter(|s| !s.trim().is_empty());
-    let handoff = nonempty(a.handoff);
-    let resume = nonempty(a.resume).unwrap_or_else(|| default_resume(handoff.as_deref()));
-    let agent = Agent {
-        id: a.id.clone(),
-        name: a.name.trim().to_string(),
-        agent_type: a.agent_type.trim().to_string(),
-        kind,
-        risk: a.risk,
-        worktree: nonempty(a.worktree),
-        handoff,
-        brief_file: nonempty(a.brief_file),
-        state: State::Running,
-        resumes_tonight: 0,
-        last_resumed: None,
-        last_failure: None,
-        resume,
-    };
-    log(l, ctx, format!("added {} ({}): {} {} {}", agent.id, agent.name, agent.agent_type, word(&agent.kind), word(&agent.risk)));
-    let out = json!({ "ok": true, "agent": agent, "note": note });
+    if let Some(o) = &old {
+        let from = o.state;
+        l.agent_mut(&o.id)?.state = State::Done;
+        log(l, ctx, format!("set {} ({}): {} -> done: redispatched as {}", o.id, o.name, word(&from), agent.id));
+    }
+    let out = json!({ "ok": true, "agent": agent, "note": note, "replaced": old.as_ref().map(|o| o.id.clone()) });
     l.agents.push(agent);
     Ok((out, true))
+}
+
+/// Fill or change an agent's fields (not its state: that is `set`). Migrated v1 agents arrive with an empty agent type.
+pub fn edit(l: &mut Ledger, ctx: &Ctx, id: &str, f: Fields) -> Out {
+    let before = l.agent(id).cloned().ok_or_else(|| format!("no agent {id:?} in the ledger"))?;
+    let (after, note) = overlay(&before, f)?;
+    let (b, a) = (serde_json::to_value(&before).map_err(|e| e.to_string())?, serde_json::to_value(&after).map_err(|e| e.to_string())?);
+    let changed: Vec<String> = a.as_object().into_iter().flatten().filter(|(k, v)| b.get(k.as_str()) != Some(*v)).map(|(k, _)| k.clone()).collect();
+    if !changed.is_empty() {
+        *l.agent_mut(id)? = after.clone();
+        log(l, ctx, format!("edited {id} ({}): {}", after.name, changed.join(", ")));
+    }
+    let any = !changed.is_empty();
+    Ok((json!({ "ok": true, "id": id, "changed": changed, "agent": after, "note": note }), any))
 }
 
 pub fn set(l: &mut Ledger, ctx: &Ctx, id: &str, state: State, note: Option<&str>) -> Out {
@@ -191,16 +289,30 @@ pub fn stopped(l: &mut Ledger, ctx: &Ctx, id: &str, text: &str) -> Out {
     let kind = classify(text).ok_or("not a recognised usage-limit message (record the state with lw set instead)")?;
     let reset = reset::parse_reset(text, ctx).ok();
     let refail = Duration::minutes(i64::from(l.run.herd_refail_min));
-    let a = l.agent_mut(id)?;
-    let since_resume = a.last_resumed.as_deref().and_then(|s| stored(ctx, s)).map(|t| ctx.now - t);
-    let herd = since_resume.is_some_and(|d| d >= Duration::zero() && d < refail);
     let (state, label) = match kind {
         LimitKind::Weekly => (State::StoppedByWeekly, "weekly"),
         LimitKind::FiveHour => (State::StoppedByLimit, "5-hour"),
     };
-    a.state = state;
-    a.last_failure = Some(format!("{label} limit at {}{}", ctx.now_str(), reset.map(|r| format!(", resets {}", ctx.fmt(r))).unwrap_or_default()));
+    let failure = format!("{label} limit at {}{}", ctx.now_str(), reset.map(|r| format!(", resets {}", ctx.fmt(r))).unwrap_or_default());
+    let reset_json = reset.map(|r| reset::schedule(r, ctx).json(ctx));
+    let a = l.agent_mut(id)?;
     let name = a.name.clone();
+    a.last_failure = Some(failure);
+    // Only a running agent can have stopped. A late or repeated notice must not revive a finished, paused or parked agent.
+    if a.state != State::Running {
+        let current = a.state;
+        log(l, ctx, format!("stopped notice for {id} ({name}): {label} limit; ignored, it is {}", word(&current)));
+        return Ok((
+            json!({
+                "id": id, "name": name, "state": word(&current), "limit": label, "reset": reset_json,
+                "ignored": true, "herd_tripped": false, "toast": Value::Null,
+            }),
+            true,
+        ));
+    }
+    let since_resume = a.last_resumed.as_deref().and_then(|s| stored(ctx, s)).map(|t| ctx.now - t);
+    let herd = since_resume.is_some_and(|d| d >= Duration::zero() && d < refail);
+    a.state = state;
     log(l, ctx, format!("stopped {id} ({name}): {label} limit"));
     let mut toast = Value::Null;
     if herd {
@@ -212,15 +324,66 @@ pub fn stopped(l: &mut Ledger, ctx: &Ctx, id: &str, text: &str) -> Out {
     }
     Ok((
         json!({
-            "id": id, "name": name, "state": word(&state), "limit": label,
-            "reset": reset.map(|r| reset::schedule(r, ctx).json(ctx)),
-            "herd_tripped": herd, "toast": toast,
+            "id": id, "name": name, "state": word(&state), "limit": label, "reset": reset_json,
+            "ignored": false, "herd_tripped": herd, "toast": toast,
         }),
         true,
     ))
 }
 
 // ---------------------------------------------------------------------------------------------------------------- tick
+
+/// When the window is open again, an unhandled wake due within this long is left to do the resuming:
+/// `batch_gap_min`, at least this many minutes. So a pending batch wake keeps its gap.
+const DUE_SOON_MIN: i64 = 5;
+
+fn due_soon(l: &Ledger) -> Duration {
+    Duration::minutes(i64::from(l.run.batch_gap_min).max(DUE_SOON_MIN))
+}
+
+/// The current wake, if it has not been handled yet.
+fn pending(l: &Ledger) -> Option<&Wake> {
+    l.wake.as_ref().filter(|w| w.handled_at.is_none())
+}
+
+/// A wake is armed once its timer is recorded: a cron one-shot for a wall or batch wake, any timer for a weekly notice.
+fn has_timer(l: &Ledger, w: &Wake) -> bool {
+    l.timers.iter().any(|t| t.token == w.token && (w.reason == Reason::Weekly || t.kind == TimerKind::CronOneshot))
+}
+
+/// Keep the pending wake. It is `armed` once its one-shot is recorded with `timer-add`; until then `arm` again with the same
+/// token (nothing new is created), moved to 2 minutes from now if its time has already gone, so the cron line still fires.
+fn keep_wake(l: &mut Ledger, ctx: &Ctx, weekly_warn: bool) -> Out {
+    let w = pending(l).cloned().ok_or("no pending wake")?;
+    if has_timer(l, &w) {
+        let mut out = arm_json("armed", &w, ctx, Vec::new());
+        out["weekly_warn"] = json!(weekly_warn);
+        return Ok((out, false));
+    }
+    let soonest = reset::from_now(ctx, reset::SOONEST_MIN);
+    let mut changed = false;
+    if stored(ctx, &w.wake_at).is_none_or(|t| t < soonest) {
+        let (wake_at, backup_at) = match (w.reason, stored(ctx, &w.for_reset)) {
+            (Reason::Wall, Some(r)) => {
+                let s = reset::schedule(r, ctx);
+                (s.wake_at, Some(s.backup_at))
+            }
+            _ => (soonest, w.backup_at.as_ref().map(|_| reset::later(soonest, reset::BACKUP_AFTER_MIN - reset::WAKE_AFTER_MIN, &ctx.zone))),
+        };
+        if let Some(cur) = l.wake.as_mut() {
+            cur.wake_at = ctx.fmt(wake_at);
+            cur.backup_at = backup_at.map(|b| ctx.fmt(b));
+        }
+        changed = true;
+        log(l, ctx, format!("{} has no one-shot recorded and its time has gone: wake moved to {}", w.token, ctx.fmt(wake_at)));
+    }
+    let w = pending(l).cloned().ok_or("no pending wake")?;
+    let mut out = arm_json("arm", &w, ctx, Vec::new());
+    out["weekly_warn"] = json!(weekly_warn);
+    out["reissued"] = json!(true);
+    out["toast"] = Value::Null;
+    Ok((out, changed))
+}
 
 pub fn tick(l: &mut Ledger, ctx: &Ctx, u: &Usage) -> Out {
     let over = u.five_pct >= l.run.arm_at_pct;
@@ -234,15 +397,32 @@ pub fn tick(l: &mut Ledger, ctx: &Ctx, u: &Usage) -> Out {
     }
     let running = l.count(State::Running);
     let limited = l.count(State::StoppedByLimit);
+    let room = l.run.max_concurrent as usize > running;
+    // An unhandled wake for a reset that has already come is due: its timer is about to fire. Never replace it.
+    let due = pending(l).is_some_and(|w| stored(ctx, &w.for_reset).is_some_and(|r| r <= ctx.now));
+
+    // The window is open again but agents are stopped by the limit (a late notice): resume them shortly, not at the next reset.
+    if limited > 0 && !over && room {
+        let soon = pending(l).is_some_and(|w| stored(ctx, &w.wake_at).is_some_and(|t| t <= ctx.now + due_soon(l)));
+        if due || soon {
+            return keep_wake(l, ctx, weekly_warn);
+        }
+        let wake_at = reset::from_now(ctx, reset::SOONEST_MIN);
+        let backup_at = reset::later(wake_at, reset::BACKUP_AFTER_MIN - reset::WAKE_AFTER_MIN, &ctx.zone);
+        let (w, deleted) = new_wake(l, ctx, Reason::Batch, u.five_resets_at, wake_at, Some(backup_at));
+        log(l, ctx, format!("armed {} (batch) at {}: the window is open, {limited} stopped by the limit; wake {}", w.token, usage_text(u), w.wake_at));
+        let mut out = arm_json("arm", &w, ctx, deleted);
+        out["weekly_warn"] = json!(weekly_warn);
+        out["reissued"] = json!(false);
+        out["toast"] = json!(format!("The window is open again: {limited} agent(s) stopped by the limit resume at {}.", ctx.hm(wake_at)));
+        return Ok((out, true));
+    }
+
     if running + limited > 0 && (over || limited > 0) {
         let s = reset::schedule(u.five_resets_at, ctx);
-        if let Some(w) = &l.wake
-            && w.handled_at.is_none()
-            && stored(ctx, &w.for_reset).is_some_and(|r| (r - s.reset).num_seconds().abs() <= SAME_RESET_SECS)
-        {
-            let mut out = arm_json("armed", w, ctx, Vec::new());
-            out["weekly_warn"] = json!(weekly_warn);
-            return Ok((out, false));
+        let same = pending(l).is_some_and(|w| stored(ctx, &w.for_reset).is_some_and(|r| (r - s.reset).num_seconds().abs() <= SAME_RESET_SECS));
+        if due || same {
+            return keep_wake(l, ctx, weekly_warn);
         }
         let (w, deleted) = new_wake(l, ctx, Reason::Wall, s.reset, s.wake_at, Some(s.backup_at));
         log(
@@ -259,6 +439,7 @@ pub fn tick(l: &mut Ledger, ctx: &Ctx, u: &Usage) -> Out {
         );
         let mut out = arm_json("arm", &w, ctx, deleted);
         out["weekly_warn"] = json!(weekly_warn);
+        out["reissued"] = json!(false);
         out["toast"] = json!(format!(
             "Armed: wake at {} for the {} reset ({running} running, {limited} stopped by the limit). Launching nothing more this window.",
             ctx.hm(s.wake_at),
@@ -487,7 +668,7 @@ pub fn next(l: &mut Ledger, ctx: &Ctx, token: &str, u: &Usage, sizes: &dyn Fn(&A
         let (mode, why) = size::mode(Some(a), bytes, over);
         a.state = State::Running;
         a.resumes_tonight += 1;
-        a.last_resumed = Some(now.clone());
+        a.prev_resumed = a.last_resumed.replace(now.clone());
         batch.push(json!({
             "id": a.id, "name": a.name, "mode": mode, "why": why, "resume": a.resume, "agent_type": a.agent_type,
             "brief_file": a.brief_file, "handoff": a.handoff, "worktree": a.worktree, "transcript_bytes": bytes,
@@ -497,13 +678,18 @@ pub fn next(l: &mut Ledger, ctx: &Ctx, token: &str, u: &Usage, sizes: &dyn Fn(&A
         log(l, ctx, format!("resumed {} ({}) as {}", b["id"].as_str().unwrap_or(""), b["name"].as_str().unwrap_or(""), b["mode"].as_str().unwrap_or("")));
     }
     let remaining = cands.len() - batch.len();
-    let (arm, deleted) = if remaining > 0 {
+    // No room at all: no batch wake (it would only poll every batch_gap_min). The tick after the next completion arms one.
+    let waiting_for_room = if take == 0 { remaining } else { 0 };
+    let (arm, deleted) = if remaining > 0 && take > 0 {
         let wake_at = reset::from_now(ctx, i64::from(l.run.batch_gap_min));
         let backup_at = reset::later(wake_at, reset::BACKUP_AFTER_MIN - reset::WAKE_AFTER_MIN, &ctx.zone);
         let (w, deleted) = new_wake(l, ctx, Reason::Batch, u.five_resets_at, wake_at, Some(backup_at));
         log(l, ctx, format!("armed {} (batch) at {}: {remaining} waiting", w.token, w.wake_at));
         (json!({ "token": w.token, "cron": ctx.cron(wake_at), "wake_at": w.wake_at, "backup_at": w.backup_at }), deleted)
     } else {
+        if waiting_for_room > 0 {
+            log(l, ctx, format!("no room: {running} running (max {}); {waiting_for_room} wait for an agent to finish", l.run.max_concurrent));
+        }
         (Value::Null, take_timers(l))
     };
     let mut toast = if batch.is_empty() {
@@ -511,7 +697,9 @@ pub fn next(l: &mut Ledger, ctx: &Ctx, token: &str, u: &Usage, sizes: &dyn Fn(&A
     } else {
         format!("Resumed {}: {}.", batch.len(), names(&batch))
     };
-    if remaining > 0 {
+    if waiting_for_room > 0 {
+        toast.push_str(&format!(" {waiting_for_room} waiting; they resume after an agent finishes."));
+    } else if remaining > 0 {
         toast.push_str(&format!(
             " {remaining} waiting; next batch at {}.",
             arm["wake_at"].as_str().and_then(|s| stored(ctx, s)).map(|t| ctx.hm(t)).unwrap_or_default()
@@ -521,9 +709,54 @@ pub fn next(l: &mut Ledger, ctx: &Ctx, token: &str, u: &Usage, sizes: &dyn Fn(&A
         toast.push_str(&format!(" Needs you: {}.", names(&needs_human)));
     }
     Ok((
-        json!({ "action": "resume", "batch": batch, "needs_human": needs_human, "remaining": remaining, "arm": arm, "delete_timers": deleted, "toast": toast }),
+        json!({
+            "action": "resume", "batch": batch, "needs_human": needs_human, "remaining": remaining, "waiting_for_room": waiting_for_room,
+            "arm": arm, "delete_timers": deleted, "toast": toast,
+        }),
         true,
     ))
+}
+
+/// Batch items the caller could not send (a send or launch failed on the limit): back to `stopped-by-limit` as if `next` had never
+/// resumed them. Their resume count and `last_resumed` are put back and the herd guard is not tripped, since they never ran.
+/// The interrupted batch counts as a wake cycle, so a window that keeps refusing sends ends at the cycle cap instead of looping.
+/// lw has no usage figures here: the caller runs `tick` next, which arms the right wake.
+pub fn unsent(l: &mut Ledger, ctx: &Ctx, ids: &[String]) -> Out {
+    let mut ids_once: Vec<&str> = Vec::new();
+    for id in ids.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if !ids_once.contains(&id) {
+            ids_once.push(id);
+        }
+    }
+    let ids = ids_once;
+    if ids.is_empty() {
+        return Err("give the ids of the batch items that were not sent".into());
+    }
+    let latest = l.agents.iter().filter_map(|a| a.last_resumed.as_deref().and_then(|s| stored(ctx, s))).max();
+    for id in &ids {
+        let a = l.agent(id).ok_or_else(|| format!("no agent {id:?} in the ledger"))?;
+        let resumed = a.last_resumed.as_deref().and_then(|s| stored(ctx, s));
+        if a.state != State::Running || resumed.is_none() || resumed != latest {
+            return Err(format!(
+                "{id} is not an item of the latest resume batch (it is {}, last resumed {})",
+                word(&a.state),
+                a.last_resumed.as_deref().unwrap_or("never")
+            ));
+        }
+    }
+    let mut out = Vec::new();
+    for id in &ids {
+        let a = l.agent_mut(id)?;
+        a.state = State::StoppedByLimit;
+        a.resumes_tonight = a.resumes_tonight.saturating_sub(1);
+        a.last_resumed = a.prev_resumed.take();
+        let (name, n) = (a.name.clone(), a.resumes_tonight);
+        log(l, ctx, format!("unsent {id} ({name}): back to stopped-by-limit, resumed {n} time(s) tonight"));
+        out.push(json!({ "id": id, "name": name }));
+    }
+    l.run.wake_cycles += 1;
+    log(l, ctx, format!("interrupted batch: {} unsent; counts as wake cycle {}", out.len(), l.run.wake_cycles));
+    Ok((json!({ "ok": true, "unsent": out, "wake_cycles": l.run.wake_cycles, "then": "tick" }), true))
 }
 
 // ---------------------------------------------------------------------------------------------------------------- run settings
@@ -637,6 +870,7 @@ pub fn migrate_v1(text: &str, ctx: &Ctx, source: &str, session_id: &str, host_se
             state,
             resumes_tonight: 0,
             last_resumed: None,
+            prev_resumed: None,
             last_failure: None,
             id,
         });

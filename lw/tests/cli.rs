@@ -129,14 +129,17 @@ fn a_night_from_arming_to_done() {
     assert_eq!(arm["cron"], "34 15 15 11 *");
     assert_eq!(arm["wake_at"], "2026-11-15T15:34:00-08:00");
     assert_eq!(arm["backup_at"], "2026-11-15T15:40:00-08:00");
+    // until the one-shot is recorded, the same wake is handed out again
     let again = e.ok("2026-11-15T14:40:00-08:00", &["tick", "--five-pct", "88", "--five-resets-at", "2026-11-15T23:30:00.201Z"]);
-    assert_eq!((again["action"].as_str(), again["token"].as_str()), (Some("armed"), Some("w1")));
+    assert_eq!((again["action"].as_str(), again["token"].as_str(), again["reissued"].as_bool()), (Some("arm"), Some("w1"), Some(true)));
 
     e.ok("2026-11-15T14:41:00-08:00", &["timer-add", "--kind", "cron-oneshot", "--id", "cron-abc", "--fires", "2026-11-15T15:34:00-08:00", "--token", "w1"]);
     e.ok(
         "2026-11-15T14:41:00-08:00",
         &["timer-add", "--kind", "desktop-task", "--id", "limit-watchdog-w1", "--fires", "2026-11-15T15:40:00-08:00", "--token", "w1"],
     );
+    let again = e.ok("2026-11-15T14:42:00-08:00", &["tick", "--five-pct", "89", "--five-resets-at", RESET]);
+    assert_eq!((again["action"].as_str(), again["token"].as_str()), (Some("armed"), Some("w1")));
     for id in ["a1", "a2", "a3"] {
         let s = e.ok("2026-11-15T15:20:00-08:00", &["stopped", id, "--text", "You've hit your 5-hour limit \u{b7} resets 3:30pm (America/Los_Angeles)"]);
         assert_eq!(s["state"], "stopped-by-limit");
@@ -282,6 +285,13 @@ fn refusals_and_command_line_errors() {
         (vec!["show", "--remove"], 2),
         (vec!["reset-time", "resets whenever"], 1),
         (vec!["size", "../a1"], 2),
+        (vec!["add", "--id", "b2", "--name", "x", "--agent-type", "t", "--kind", "resumable"], 2),
+        (vec!["add", "--id", "b3", "--replaces", "zz"], 1),
+        (vec!["edit", "a1"], 2),
+        (vec!["edit", "a1", "--kind", "sometimes"], 2),
+        (vec!["edit", "zz", "--name", "x"], 1),
+        (vec!["unsent"], 2),
+        (vec!["unsent", "a1"], 1),
     ] {
         let r = e.at(T0, &args);
         assert_eq!(r.code, code, "{args:?}: {}{}", r.out, r.err);
@@ -397,6 +407,84 @@ fn a_stale_lock_is_taken_over_and_removed() {
 
 fn no_temp_files(dir: &Path) -> bool {
     std::fs::read_dir(dir).unwrap().all(|f| !f.unwrap().file_name().to_string_lossy().contains(".tmp-"))
+}
+
+#[test]
+fn init_warns_without_a_host_session_id() {
+    let e = Env::new();
+    let r = e.raw(e.cmd().env_remove("CLAUDE_CODE_HOST_SESSION_ID"), &["--ledger", e.ledger().to_str().unwrap(), "--now", T0, "init"]);
+    let v = r.json();
+    assert_eq!(v["host_session_id"], "");
+    let warnings = v["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{v}");
+    assert!(warnings[0].as_str().unwrap().contains("CLAUDE_CODE_HOST_SESSION_ID is empty"), "{v}");
+    assert!(r.err.contains("warning"), "{}", r.err);
+    // with both ids set there is nothing to warn about
+    let e = Env::new();
+    assert_eq!(e.ok(T0, &["init"])["warnings"], serde_json::json!([]));
+}
+
+#[test]
+fn the_fall_back_night_moves_a_wake_out_of_the_repeated_hour() {
+    // LW_TZ is America/Los_Angeles: on 2026-11-01, 01:00-01:59 happens twice
+    let e = Env::new();
+    let r = e.ok("2026-11-01T00:30:00-07:00", &["reset-time", "2026-11-01T08:10:00Z"]);
+    assert_eq!(r["reset"], "2026-11-01T01:10:00-07:00");
+    assert_eq!((r["wake_at"].as_str(), r["cron"].as_str()), (Some("2026-11-01T02:01:00-08:00"), Some("1 2 1 11 *")));
+    assert_eq!(r["backup_at"], "2026-11-01T02:06:00-08:00");
+    e.ok("2026-11-01T00:30:00-07:00", &["init"]);
+    add(&e, "a1", "general-purpose", "local-writes");
+    let arm = e.ok("2026-11-01T00:30:00-07:00", &["tick", "--five-pct", "90", "--five-resets-at", "2026-11-01T09:10:00Z"]);
+    assert_eq!((arm["wake_at"].as_str(), arm["cron"].as_str()), (Some("2026-11-01T02:01:00-08:00"), Some("1 2 1 11 *")));
+}
+
+#[test]
+fn a_late_notice_through_the_binary() {
+    let e = Env::new();
+    e.ok(T0, &["init"]);
+    add(&e, "a1", "general-purpose", "local-writes");
+    add(&e, "a2", "general-purpose", "local-writes");
+    e.ok(T0, &["set", "a2", "done"]);
+    // read at 15:34, the 15:30 reset is today's, and the wake is 2 minutes out
+    let s = e.ok("2026-11-15T15:34:00-08:00", &["stopped", "a1", "--text", "You've hit your 5-hour limit \u{b7} resets 3:30pm"]);
+    assert_eq!((s["reset"]["reset"].as_str(), s["reset"]["wake_at"].as_str()), (Some("2026-11-15T15:30:00-08:00"), Some("2026-11-15T15:36:00-08:00")));
+    assert_eq!(s["ignored"], false);
+    // the finished agent stays finished
+    let s = e.ok("2026-11-15T15:34:00-08:00", &["stopped", "a2", "--text", "You've hit your 5-hour limit \u{b7} resets 3:30pm"]);
+    assert_eq!((s["ignored"].as_bool(), s["state"].as_str()), (Some(true), Some("done")));
+    assert_eq!(e.read_ledger()["agents"][1]["state"], "done");
+    // the window is open again: a batch 2 minutes out, not a wall wake at the next reset
+    let t = e.ok("2026-11-15T15:34:00-08:00", &["tick", "--five-pct", "1", "--five-resets-at", RESET2]);
+    assert_eq!((t["action"].as_str(), t["reason"].as_str(), t["wake_at"].as_str()), (Some("arm"), Some("batch"), Some("2026-11-15T15:36:00-08:00")));
+}
+
+#[test]
+fn redispatch_edit_and_unsent_through_the_binary() {
+    let e = Env::new();
+    e.ok(T0, &["init"]);
+    add(&e, "a1", "general-purpose", "local-writes");
+    add(&e, "a2", "general-purpose", "local-writes");
+    for id in ["a1", "a2"] {
+        e.ok(T0, &["stopped", id, "--text", "usage limit reached"]);
+    }
+    e.ok(T0, &["tick", "--five-pct", "100", "--five-resets-at", RESET]);
+    let n = e.ok("2026-11-15T15:34:00-08:00", &["next", "--token", "w1", "--five-pct", "2", "--five-resets-at", RESET2]);
+    assert_eq!(n["batch"].as_array().unwrap().len(), 2);
+    // a1 is re-dispatched (no transcript) as b1; sending to a2 fails on the limit
+    let r = e.ok("2026-11-15T15:35:00-08:00", &["add", "--id", "b1", "--replaces", "a1"]);
+    assert_eq!((r["replaced"].as_str(), r["agent"]["name"].as_str(), r["agent"]["resumes_tonight"].as_u64()), (Some("a1"), Some("a1 stream"), Some(1)));
+    let u = e.ok("2026-11-15T15:35:00-08:00", &["unsent", "a2"]);
+    assert_eq!(u["then"], "tick");
+    let l = e.read_ledger();
+    let state = |id: &str| l["agents"].as_array().unwrap().iter().find(|a| a["id"] == id).unwrap().clone();
+    assert_eq!(state("a1")["state"], "done");
+    assert_eq!((state("a2")["state"].as_str(), state("a2")["resumes_tonight"].as_u64()), (Some("stopped-by-limit"), Some(0)));
+    assert_eq!(state("b1")["state"], "running");
+    assert_eq!(l["run"]["herd_tripped"], false);
+    // fill a field on b1
+    let ed = e.ok("2026-11-15T15:36:00-08:00", &["edit", "b1", "--agent-type", "Plan"]);
+    assert_eq!(ed["changed"], serde_json::json!(["agent_type", "kind"]));
+    assert_eq!(e.read_ledger()["agents"][2]["kind"], "redispatch");
 }
 
 #[test]

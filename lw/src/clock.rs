@@ -48,6 +48,15 @@ impl Zone {
         };
         at(n).or_else(|| at(n + Duration::hours(1)))
     }
+
+    /// True when the local wall time of `t` happens twice (clocks going back), so a cron line for it names two instants.
+    pub fn ambiguous(&self, t: DateTime<Utc>) -> bool {
+        let n = self.naive(t);
+        match self {
+            Zone::System => matches!(Local.from_local_datetime(&n), LocalResult::Ambiguous(..)),
+            Zone::Named(tz) => matches!(tz.from_local_datetime(&n), LocalResult::Ambiguous(..)),
+        }
+    }
 }
 
 /// An IANA zone name ("America/Los_Angeles"); case does not matter.

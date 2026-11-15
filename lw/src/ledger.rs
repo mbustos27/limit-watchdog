@@ -1,7 +1,8 @@
 //! The ledger (schema version 2) and the only code that reads or writes it.
 //!
-//! Every change happens under `<ledger>.lock` (exclusive create; waits up to 10 s; a lock older than 60 s is stale and removed)
-//! and is written to a temp file in the same folder, then renamed over the ledger, so a reader never sees half a file.
+//! Every change happens under `<ledger>.lock` (exclusive create holding a random nonce; waits up to 10 s; a lock older than 60 s
+//! is stale and taken over by an atomic rename; released only while it still holds the holder's nonce) and is written to a temp
+//! file in the same folder, then renamed over the ledger, so a reader never sees half a file.
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -139,6 +140,9 @@ pub struct Agent {
     pub resumes_tonight: u32,
     #[serde(default)]
     pub last_resumed: Option<String>,
+    /// `last_resumed` before the latest resume, so `unsent` can put it back.
+    #[serde(default)]
+    pub prev_resumed: Option<String>,
     #[serde(default)]
     pub last_failure: Option<String>,
     #[serde(default)]
@@ -328,31 +332,93 @@ impl Store {
     }
 }
 
-/// Holds `<ledger>.lock`; dropping it removes the file.
+/// Holds `<ledger>.lock`, which contains this holder's random nonce. Dropping it removes the file only if it still holds that nonce:
+/// if the lock was taken over as stale meanwhile, the new holder's lock stays.
 #[derive(Debug)]
 pub struct LockGuard {
     path: PathBuf,
+    content: String,
 }
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let tag = format!("released-{}", nonce());
+        remove_if(&self.path, &self.content, &tag);
     }
+}
+
+/// 128 random bits as hex, from the standard library's randomly keyed hasher (no extra crate), mixed with the pid, the time and a counter.
+pub fn nonce() -> String {
+    use std::hash::{BuildHasher, RandomState};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let a = RandomState::new().hash_one((std::process::id(), nanos, c));
+    let b = RandomState::new().hash_one((a, c, nanos));
+    format!("{a:016x}{b:016x}")
+}
+
+fn busy(e: &std::io::Error) -> bool {
+    // Windows answers "access denied" (or a sharing violation) for a lock file that is being deleted: same as "taken", try again.
+    matches!(e.kind(), std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied) || e.raw_os_error() == Some(32)
+}
+
+/// The lock's content if the lock is older than `stale`. Content and age come from one open handle, so they belong to the same file.
+fn stale_content(path: &Path, stale: Duration) -> Option<String> {
+    use std::io::Read;
+    let mut f = fs::File::open(path).ok()?;
+    let age = f.metadata().ok()?.modified().ok().and_then(|m| SystemTime::now().duration_since(m).ok())?;
+    if age <= stale {
+        return None;
+    }
+    let mut s = String::new();
+    f.read_to_string(&mut s).ok()?;
+    Some(s)
+}
+
+/// Move the lock aside under a name of our own, then delete it if it is the lock we meant (`expect`), else put it back.
+/// The rename is atomic: of two processes that both mean to remove the same lock, only one moves it, and a lock that was
+/// replaced in the meantime is recognised by its nonce and restored. True when the expected lock was removed.
+fn remove_if(path: &Path, expect: &str, tag: &str) -> bool {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{tag}"));
+    let aside = PathBuf::from(name);
+    if fs::rename(path, &aside).is_err() {
+        return false;
+    }
+    let ours = fs::read_to_string(&aside).is_ok_and(|c| c == expect);
+    if !ours {
+        // Someone else's lock: put it back. A hard link never replaces a lock that appeared meanwhile.
+        if fs::hard_link(&aside, path).is_err_and(|e| e.kind() != std::io::ErrorKind::AlreadyExists) && !path.exists() {
+            let _ = fs::rename(&aside, path);
+        }
+    }
+    let _ = fs::remove_file(&aside);
+    ours
 }
 
 pub fn acquire_lock(path: &Path, wait: Duration, stale: Duration) -> Result<LockGuard, String> {
     let start = Instant::now();
+    let me = nonce();
+    let content = format!("lw pid {} nonce {me}\n", std::process::id());
     loop {
         match OpenOptions::new().write(true).create_new(true).open(path) {
             Ok(mut f) => {
-                let _ = writeln!(f, "lw pid {}", std::process::id());
-                return Ok(LockGuard { path: path.to_path_buf() });
-            }
-            // Windows answers "access denied" for a lock file that is being deleted: same as "taken", try again.
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied) => {
-                let age = fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|m| SystemTime::now().duration_since(m).ok());
-                if age.is_some_and(|a| a > stale) {
+                let written = f.write_all(content.as_bytes()).and_then(|()| f.flush());
+                drop(f);
+                if let Err(e) = written {
+                    // Created a moment ago, so it cannot look stale to anyone yet: it is still ours to remove.
                     let _ = fs::remove_file(path);
+                    return Err(format!("could not write the lock {}: {e}", path.display()));
+                }
+                return Ok(LockGuard { path: path.to_path_buf(), content });
+            }
+            Err(e) if busy(&e) => {
+                if let Some(old) = stale_content(path, stale)
+                    && remove_if(path, &old, &format!("stale-{me}"))
+                {
+                    continue;
                 }
                 if start.elapsed() >= wait {
                     return Err(format!("the ledger is locked ({} exists); waited {} s", path.display(), wait.as_secs_f32()));
@@ -484,6 +550,51 @@ mod tests {
         let g = acquire_lock(&lock, Duration::from_secs(2), Duration::from_millis(100)).unwrap();
         assert!(fs::read_to_string(&lock).unwrap().starts_with("lw pid"));
         drop(g);
+        assert!(!lock.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0, "nothing left beside the lock");
+    }
+
+    #[test]
+    fn each_lock_holds_its_own_nonce() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("l.json.lock");
+        let held = || {
+            let g = acquire_lock(&lock, Duration::from_secs(1), Duration::from_secs(60)).unwrap();
+            let c = fs::read_to_string(&lock).unwrap();
+            drop(g);
+            c
+        };
+        let (a, b) = (held(), held());
+        assert_ne!(a, b);
+        assert!(b.contains(" nonce ") && b.trim_end().rsplit(' ').next().unwrap().len() == 32, "{b}");
+    }
+
+    #[test]
+    fn release_leaves_a_lock_that_is_no_longer_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("l.json.lock");
+        let g = acquire_lock(&lock, Duration::from_secs(1), Duration::from_secs(60)).unwrap();
+        // this holder stalled past the stale age, and another process took the lock over
+        fs::write(&lock, "lw pid 999 nonce 0123456789abcdef0123456789abcdef\n").unwrap();
+        drop(g);
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "lw pid 999 nonce 0123456789abcdef0123456789abcdef\n");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "only the other holder's lock");
+    }
+
+    #[test]
+    fn a_stale_takeover_removes_only_the_lock_it_judged_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("l.json.lock");
+        // a waiter read the stale lock (old content); before its takeover, another waiter already replaced it with a fresh one
+        let fresh = "lw pid 2 nonce ffffffffffffffffffffffffffffffff\n";
+        fs::write(&lock, fresh).unwrap();
+        assert!(!remove_if(&lock, "lw pid 1 nonce 00000000000000000000000000000000\n", "stale-test"));
+        assert_eq!(fs::read_to_string(&lock).unwrap(), fresh, "the fresh lock is put back");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        // the lock it did judge stale goes
+        assert!(remove_if(&lock, fresh, "stale-test"));
+        assert!(!lock.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

@@ -24,9 +24,13 @@ fn agent(id: &str, risk: Risk, state: State) -> Agent {
         state,
         resumes_tonight: 0,
         last_resumed: None,
+        prev_resumed: None,
         last_failure: None,
         resume: default_resume(Some("HANDOFF.md")),
     }
+}
+fn cron(l: &mut Ledger, at: &str, id: &str, token: &str) {
+    timer_add(l, &ctx(at), TimerKind::CronOneshot, id, t("2026-11-15T23:59:00-08:00"), token).unwrap();
 }
 fn ledger(agents: Vec<Agent>) -> Ledger {
     let mut l = Ledger::new("sess", "local_host", "proj", "2026-11-15T10:00:00-08:00");
@@ -73,14 +77,37 @@ fn tick_arms_once_then_is_idempotent() {
     assert_eq!(out["backup_at"], "2026-11-15T15:40:00-08:00");
     assert_eq!(out["for_reset"], "2026-11-15T15:30:00-08:00");
     assert!(out["toast"].as_str().unwrap().contains("15:34"));
+    assert_eq!(out["reissued"], false);
     let snapshot = l.clone();
-    // same reset (milliseconds drift), higher usage: nothing changes
+    // same reset (milliseconds drift), higher usage, but no one-shot recorded yet: arm again with the same token, nothing new
     let (again, changed) = tick(&mut l, &ctx("2026-11-15T14:20:00-08:00"), &usage(93, "2026-11-15T23:30:00.201Z")).unwrap();
     assert!(!changed);
-    assert_eq!(again["action"], "armed");
-    assert_eq!(again["token"], "w1");
+    assert_eq!((again["action"].as_str(), again["token"].as_str(), again["reissued"].as_bool()), (Some("arm"), Some("w1"), Some(true)));
     assert_eq!(again["cron"], "34 15 15 11 *");
     assert_eq!(l, snapshot);
+    // a Desktop task alone does not count
+    timer_add(&mut l, &ctx("2026-11-15T14:21:00-08:00"), TimerKind::DesktopTask, "task-1", t("2026-11-15T15:40:00-08:00"), "w1").unwrap();
+    assert_eq!(tick(&mut l, &ctx("2026-11-15T14:22:00-08:00"), &usage(93, R1)).unwrap().0["action"], "arm");
+    // once the one-shot is recorded: armed, and nothing changes
+    cron(&mut l, "2026-11-15T14:23:00-08:00", "cron-1", "w1");
+    let snapshot = l.clone();
+    let (again, changed) = tick(&mut l, &ctx("2026-11-15T14:30:00-08:00"), &usage(95, "2026-11-15T23:30:00.201Z")).unwrap();
+    assert!(!changed);
+    assert_eq!((again["action"].as_str(), again["token"].as_str(), again["cron"].as_str()), (Some("armed"), Some("w1"), Some("34 15 15 11 *")));
+    assert_eq!(l, snapshot);
+}
+
+#[test]
+fn a_reissued_arm_whose_time_has_gone_moves_to_two_minutes_from_now() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::Running)]);
+    tick(&mut l, &ctx("2026-11-15T15:00:00-08:00"), &usage(85, R1)).unwrap();
+    // no timer recorded; 15:40 is past the 15:34 wake (and the reset): same token, new time
+    let (out, changed) = tick(&mut l, &ctx("2026-11-15T15:40:00-08:00"), &usage(100, R1)).unwrap();
+    assert!(changed);
+    assert_eq!((out["action"].as_str(), out["token"].as_str()), (Some("arm"), Some("w1")));
+    assert_eq!(out["wake_at"], "2026-11-15T15:42:00-08:00");
+    assert_eq!(out["cron"], "42 15 15 11 *");
+    assert_eq!(l.run.wake_seq, 1);
 }
 
 #[test]
@@ -95,10 +122,79 @@ fn tick_is_ok_below_the_threshold_and_never_arms_without_agents() {
 }
 
 #[test]
-fn tick_arms_on_a_limit_failure_even_below_the_threshold() {
+fn a_limit_failure_with_the_window_open_arms_a_batch_two_minutes_out() {
     let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::StoppedByLimit)]);
-    let (out, _) = tick(&mut l, &ctx("2026-11-15T14:00:00-08:00"), &usage(40, R1)).unwrap();
-    assert_eq!(out["action"], "arm");
+    let (out, changed) = tick(&mut l, &ctx("2026-11-15T14:00:00-08:00"), &usage(40, R1)).unwrap();
+    assert!(changed);
+    assert_eq!((out["action"].as_str(), out["reason"].as_str()), (Some("arm"), Some("batch")));
+    assert_eq!(out["wake_at"], "2026-11-15T14:02:00-08:00");
+    assert_eq!(out["cron"], "2 14 15 11 *");
+    // with no room it waits for the reset instead (and the tick after a completion arms the batch)
+    let mut full = ledger(vec![agent("a1", Risk::LocalWrites, State::StoppedByLimit)]);
+    full.run.max_concurrent = 1;
+    full.agents.push(agent("r1", Risk::LocalWrites, State::Running));
+    let (out, _) = tick(&mut full, &ctx("2026-11-15T14:00:00-08:00"), &usage(40, R1)).unwrap();
+    assert_eq!((out["action"].as_str(), out["reason"].as_str()), (Some("arm"), Some("wall")));
+}
+
+#[test]
+fn a_late_notice_after_the_reset_resumes_now_not_at_the_next_reset() {
+    // armed for R1 (15:30) and handled at 15:34 with nothing to resume; then a notice from before the reset arrives at 15:50
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::Running), agent("a2", Risk::LocalWrites, State::Running)]);
+    let w1 = armed(&mut l);
+    let (_, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(1, R2), &small).unwrap();
+    stopped(&mut l, &ctx("2026-11-15T15:50:00-08:00"), "a1", "You've hit your 5-hour limit \u{b7} resets 3:30pm").unwrap();
+    let (out, _) = tick(&mut l, &ctx("2026-11-15T15:50:00-08:00"), &usage(3, R2)).unwrap();
+    assert_eq!((out["action"].as_str(), out["reason"].as_str(), out["wake_at"].as_str()), (Some("arm"), Some("batch"), Some("2026-11-15T15:52:00-08:00")));
+    // a pending wall wake for the next reset is replaced by the batch
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::Running)]);
+    let (wall, _) = tick(&mut l, &ctx("2026-11-15T16:00:00-08:00"), &usage(85, R2)).unwrap();
+    cron(&mut l, "2026-11-15T16:00:00-08:00", "cron-9", wall["token"].as_str().unwrap());
+    stopped(&mut l, &ctx("2026-11-15T16:10:00-08:00"), "a1", "usage limit reached").unwrap();
+    let (out, _) = tick(&mut l, &ctx("2026-11-15T16:10:00-08:00"), &usage(10, R2)).unwrap();
+    assert_eq!((out["action"].as_str(), out["reason"].as_str()), (Some("arm"), Some("batch")));
+    assert_eq!(out["delete_timers"], json!(["cron-9"]));
+}
+
+#[test]
+fn a_pending_wake_due_soon_is_kept_when_the_window_is_open() {
+    let mut l = ledger(vec![
+        agent("a1", Risk::LocalWrites, State::StoppedByLimit),
+        agent("a2", Risk::LocalWrites, State::StoppedByLimit),
+        agent("a3", Risk::LocalWrites, State::StoppedByLimit),
+    ]);
+    let w1 = armed(&mut l);
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(2, R2), &small).unwrap();
+    let w2 = out["arm"]["token"].as_str().unwrap().to_string();
+    cron(&mut l, "2026-11-15T15:34:30-08:00", "cron-2", &w2);
+    // a1 finishes: the batch wake at 15:46 keeps its gap
+    set(&mut l, &ctx("2026-11-15T15:36:00-08:00"), "a1", State::Done, None).unwrap();
+    let snapshot = l.clone();
+    let (out, changed) = tick(&mut l, &ctx("2026-11-15T15:36:00-08:00"), &usage(5, R2)).unwrap();
+    assert_eq!((out["action"].as_str(), out["token"].as_str(), changed), (Some("armed"), Some(w2.as_str()), false));
+    assert_eq!(l, snapshot);
+}
+
+#[test]
+fn tick_never_replaces_a_wake_whose_reset_has_come() {
+    // w1 is for 15:30; at 15:32 a late notice comes in with every slot taken, and usage already shows the next reset
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::Running)]);
+    l.run.max_concurrent = 1;
+    let w1 = armed(&mut l);
+    l.agents.push(agent("a2", Risk::LocalWrites, State::StoppedByLimit));
+    let snapshot = l.clone();
+    let (out, changed) = tick(&mut l, &ctx("2026-11-15T15:32:00-08:00"), &usage(90, R2)).unwrap();
+    assert_eq!((out["action"].as_str(), out["token"].as_str(), changed), (Some("armed"), Some(w1.as_str()), false));
+    assert_eq!(l, snapshot);
+    // with the window open and room, too
+    l.run.max_concurrent = 4;
+    let (out, _) = tick(&mut l, &ctx("2026-11-15T15:32:00-08:00"), &usage(1, R2)).unwrap();
+    assert_eq!((out["action"].as_str(), out["token"].as_str()), (Some("armed"), Some(w1.as_str())));
+    // the same time before the reset, a different reset replaces it
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::Running)]);
+    armed(&mut l);
+    let (out, _) = tick(&mut l, &ctx("2026-11-15T15:00:00-08:00"), &usage(90, R2)).unwrap();
+    assert_eq!((out["action"].as_str(), out["token"].as_str()), (Some("arm"), Some("w2")));
 }
 
 #[test]
@@ -119,7 +215,8 @@ fn tick_warns_on_weekly_usage() {
 fn tick_arms_again_for_a_different_reset_and_drops_the_old_timers() {
     let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::Running)]);
     armed(&mut l);
-    let (out, changed) = tick(&mut l, &ctx("2026-11-15T16:00:00-08:00"), &usage(85, R2)).unwrap();
+    // before R1 has come (after it, see tick_never_replaces_a_wake_whose_reset_has_come)
+    let (out, changed) = tick(&mut l, &ctx("2026-11-15T15:10:00-08:00"), &usage(85, R2)).unwrap();
     assert!(changed);
     assert_eq!(out["action"], "arm");
     assert_eq!(out["token"], "w2");
@@ -349,7 +446,7 @@ fn batches_go_read_only_first_then_smallest_and_respect_size_and_concurrency() {
 }
 
 #[test]
-fn a_full_house_resumes_nobody_and_tries_again_later() {
+fn a_full_house_resumes_nobody_and_waits_for_a_completion_instead_of_polling() {
     let mut l = ledger(vec![
         agent("a1", Risk::LocalWrites, State::StoppedByLimit),
         agent("r1", Risk::LocalWrites, State::Running),
@@ -361,8 +458,26 @@ fn a_full_house_resumes_nobody_and_tries_again_later() {
     let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(2, R2), &small).unwrap();
     assert_eq!(out["action"], "resume");
     assert_eq!(out["batch"], json!([]));
-    assert_eq!(out["remaining"], 1);
-    assert!(out["arm"]["token"].is_string());
+    assert_eq!((out["remaining"].as_u64(), out["waiting_for_room"].as_u64()), (Some(1), Some(1)));
+    assert_eq!(out["arm"], Value::Null);
+    assert_eq!(out["delete_timers"], json!(["cron-1", "task-1"]));
+    assert_eq!(l.run.wake_seq, 1, "no batch wake");
+    // while all four still run, tick does not arm (the window is open, but there is no room)
+    let (out, _) = tick(&mut l, &ctx("2026-11-15T15:40:00-08:00"), &usage(5, R2)).unwrap();
+    assert_ne!(out["reason"], "batch");
+    // an agent finishes: the tick after it arms the batch
+    set(&mut l, &ctx("2026-11-15T15:50:00-08:00"), "r1", State::Done, None).unwrap();
+    let (out, _) = tick(&mut l, &ctx("2026-11-15T15:50:00-08:00"), &usage(5, R2)).unwrap();
+    assert_eq!((out["action"].as_str(), out["reason"].as_str(), out["wake_at"].as_str()), (Some("arm"), Some("batch"), Some("2026-11-15T15:52:00-08:00")));
+}
+
+#[test]
+fn a_batch_with_room_left_still_waits_the_batch_gap() {
+    let mut l = ledger((1..=3).map(|i| agent(&format!("a{i}"), Risk::LocalWrites, State::StoppedByLimit)).collect());
+    let w1 = armed(&mut l);
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(2, R2), &small).unwrap();
+    assert_eq!((out["remaining"].as_u64(), out["waiting_for_room"].as_u64()), (Some(1), Some(0)));
+    assert_eq!(out["arm"]["wake_at"], "2026-11-15T15:46:00-08:00");
 }
 
 #[test]
@@ -431,8 +546,28 @@ fn stopped_classifies_the_notice() {
     assert!(stopped(&mut l, &c, "a1", "API Error: 500 internal server error").is_err());
     assert!(stopped(&mut l, &c, "nobody", "5-hour limit reached").is_err());
     // a notice without a readable reset still records the stop
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::Running)]);
     let (out, _) = stopped(&mut l, &c, "a1", "Agent was stopped by a usage limit").unwrap();
-    assert_eq!((out["state"].as_str(), out["reset"].is_null()), (Some("stopped-by-limit"), true));
+    assert_eq!((out["state"].as_str(), out["reset"].is_null(), out["ignored"].as_bool()), (Some("stopped-by-limit"), true, Some(false)));
+}
+
+#[test]
+fn a_notice_for_an_agent_that_is_not_running_changes_only_its_last_failure() {
+    let c = ctx("2026-11-15T14:00:00-08:00");
+    for st in [State::Done, State::NeedsHuman, State::PausedByUser, State::StoppedByWeekly, State::StoppedByLimit] {
+        let mut a = agent("a1", Risk::LocalWrites, st);
+        a.last_resumed = Some("2026-11-15T13:55:00-08:00".into()); // would trip the herd guard if it counted
+        let mut l = ledger(vec![a]);
+        let (out, changed) = stopped(&mut l, &c, "a1", "You've hit your 5-hour limit \u{b7} resets 3:30pm").unwrap();
+        assert!(changed);
+        assert_eq!(out["ignored"], true, "{st:?}");
+        assert_eq!(out["state"], word(&st));
+        assert_eq!(out["herd_tripped"], false);
+        assert_eq!(l.agents[0].state, st);
+        assert!(!l.run.herd_tripped);
+        assert!(l.agents[0].last_failure.as_deref().unwrap().starts_with("5-hour limit at"));
+        assert!(l.log.last().unwrap().msg.contains("ignored"));
+    }
 }
 
 #[test]
@@ -441,14 +576,15 @@ fn add_validates_and_forces_redispatch_for_explore_and_plan() {
     let c = ctx("2026-11-15T14:00:00-08:00");
     let na = |id: &str, ty: &str| NewAgent {
         id: id.into(),
-        name: "stream".into(),
-        agent_type: ty.into(),
-        kind: Kind::Resumable,
-        risk: Risk::ReadOnly,
-        worktree: None,
-        handoff: Some("C:\\wt\\HANDOFF.md".into()),
-        brief_file: None,
-        resume: None,
+        replaces: None,
+        fields: Fields {
+            name: Some("stream".into()),
+            agent_type: Some(ty.into()),
+            kind: Some(Kind::Resumable),
+            risk: Some(Risk::ReadOnly),
+            handoff: Some("C:\\wt\\HANDOFF.md".into()),
+            ..Fields::default()
+        },
     };
     let (out, _) = add(&mut l, &c, na("x1", "Explore")).unwrap();
     assert_eq!(out["agent"]["kind"], "redispatch");
@@ -461,6 +597,140 @@ fn add_validates_and_forces_redispatch_for_explore_and_plan() {
     assert_eq!(out["agent"]["kind"], "resumable");
     assert!(add(&mut l, &c, na("x3", "general-purpose")).unwrap_err().contains("already"));
     assert!(add(&mut l, &c, na("../x", "general-purpose")).is_err());
+    // without --replaces every field is required
+    let mut bare = na("x4", "general-purpose");
+    bare.fields.risk = None;
+    assert!(add(&mut l, &c, bare).unwrap_err().contains("--risk"));
+}
+
+#[test]
+fn a_redispatch_keeps_the_resume_count_and_the_fields_not_given() {
+    // o1 was resumed twice tonight; the second time as a redispatch, so the skill launches a fresh agent n1 for it
+    let mut old = agent("o1", Risk::LocalWrites, State::Running);
+    old.resumes_tonight = 2;
+    old.last_resumed = Some("2026-11-15T15:34:00-08:00".into());
+    old.prev_resumed = Some("2026-11-15T10:34:00-08:00".into());
+    old.resume = default_resume(old.handoff.as_deref());
+    let mut l = ledger(vec![old]);
+    let c = ctx("2026-11-15T15:35:00-08:00");
+    let (out, changed) =
+        add(&mut l, &c, NewAgent { id: "n1".into(), replaces: Some("o1".into()), fields: Fields { name: Some("renamed".into()), ..Fields::default() } })
+            .unwrap();
+    assert!(changed);
+    assert_eq!(out["replaced"], "o1");
+    let n = l.agent("n1").unwrap().clone();
+    assert_eq!(
+        (n.name.as_str(), n.agent_type.as_str(), n.kind, n.risk, n.state),
+        ("renamed", "general-purpose", Kind::Resumable, Risk::LocalWrites, State::Running)
+    );
+    assert_eq!(
+        (n.worktree.as_deref(), n.handoff.as_deref(), n.brief_file.as_deref()),
+        (Some("C:\\wt\\o1"), Some("C:\\wt\\o1\\HANDOFF.md"), Some("C:\\wt\\o1\\BRIEF.md"))
+    );
+    assert_eq!((n.resumes_tonight, n.last_resumed.as_deref()), (2, Some("2026-11-15T15:34:00-08:00")));
+    assert_eq!(n.resume, default_resume(Some("C:\\wt\\o1\\HANDOFF.md")));
+    let o = l.agent("o1").unwrap();
+    assert_eq!(o.state, State::Done);
+    let log: Vec<&str> = l.log.iter().map(|e| e.msg.as_str()).collect();
+    assert!(log.iter().any(|m| m.starts_with("added n1 (renamed)") && m.contains("replacing o1")), "{log:?}");
+    assert!(log.contains(&"set o1 (o1-stream): running -> done: redispatched as n1"), "{log:?}");
+    // the cap still holds for the new agent: if it stops on the limit it goes to a person, not back into a batch
+    stopped(&mut l, &ctx("2026-11-15T16:30:00-08:00"), "n1", "usage limit reached").unwrap();
+    let w = tick(&mut l, &ctx("2026-11-15T16:30:00-08:00"), &usage(100, R2)).unwrap().0["token"].as_str().unwrap().to_string();
+    let (out, _) = next(&mut l, &ctx("2026-11-15T20:34:00-08:00"), &w, &usage(1, "2026-11-16T01:30:00-08:00"), &small).unwrap();
+    assert_eq!(out["needs_human"][0]["id"], "n1");
+    assert!(out["needs_human"][0]["why"].as_str().unwrap().contains("already resumed 2"), "{out}");
+    // a new handoff carries a default resume text along with it; a missing old agent is an error
+    let (out, _) = add(
+        &mut l,
+        &c,
+        NewAgent { id: "n2".into(), replaces: Some("n1".into()), fields: Fields { handoff: Some("C:\\wt\\n2\\HANDOFF.md".into()), ..Fields::default() } },
+    )
+    .unwrap();
+    assert_eq!(out["agent"]["resume"], default_resume(Some("C:\\wt\\n2\\HANDOFF.md")));
+    assert!(add(&mut l, &c, NewAgent { id: "n3".into(), replaces: Some("zz".into()), fields: Fields::default() }).unwrap_err().contains("--replaces"));
+}
+
+#[test]
+fn edit_fills_fields_on_an_existing_agent() {
+    let v1 = r#"[{"id":"m1","stream":"migrated","state":"stopped-by-limit"}]"#;
+    let (mut l, _) = migrate_v1(v1, &ctx("2026-11-15T14:00:00-08:00"), "x", "s", "h").unwrap();
+    let c = ctx("2026-11-15T14:05:00-08:00");
+    assert_eq!(l.agents[0].agent_type, "");
+    let f =
+        Fields { agent_type: Some("general-purpose".into()), risk: Some(Risk::ReadOnly), handoff: Some("C:\\wt\\m1\\HANDOFF.md".into()), ..Fields::default() };
+    let (out, changed) = edit(&mut l, &c, "m1", f).unwrap();
+    assert!(changed);
+    assert_eq!(out["changed"], json!(["agent_type", "handoff", "resume", "risk"]));
+    let a = &l.agents[0];
+    assert_eq!((a.agent_type.as_str(), a.risk, a.state, a.name.as_str()), ("general-purpose", Risk::ReadOnly, State::StoppedByLimit, "migrated"));
+    assert_eq!(a.resume, default_resume(Some("C:\\wt\\m1\\HANDOFF.md")));
+    assert!(l.log.last().unwrap().msg.starts_with("edited m1 (migrated): agent_type"));
+    // Explore is forced to redispatch; an empty path clears; nothing new changes nothing
+    let (out, _) = edit(&mut l, &c, "m1", Fields { agent_type: Some("Explore".into()), worktree: Some(String::new()), ..Fields::default() }).unwrap();
+    assert!(out["note"].is_string());
+    assert_eq!(l.agents[0].kind, Kind::Redispatch);
+    let snapshot = l.clone();
+    let (out, changed) = edit(&mut l, &c, "m1", Fields { agent_type: Some("Explore".into()), ..Fields::default() }).unwrap();
+    assert_eq!((changed, out["changed"].clone()), (false, json!([])));
+    assert_eq!(l, snapshot);
+    assert!(edit(&mut l, &c, "m1", Fields { name: Some(" ".into()), ..Fields::default() }).is_err());
+    assert!(edit(&mut l, &c, "zz", Fields { name: Some("x".into()), ..Fields::default() }).is_err());
+}
+
+#[test]
+fn unsent_puts_an_interrupted_batch_back_without_the_herd_guard() {
+    let mut a1 = agent("a1", Risk::LocalWrites, State::StoppedByLimit);
+    a1.resumes_tonight = 1;
+    a1.last_resumed = Some("2026-11-15T10:34:00-08:00".into());
+    let mut l = ledger(vec![a1, agent("a2", Risk::LocalWrites, State::StoppedByLimit), agent("a3", Risk::LocalWrites, State::StoppedByLimit)]);
+    let w1 = armed(&mut l);
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(2, R2), &small).unwrap();
+    let ids: Vec<&str> = out["batch"].as_array().unwrap().iter().map(|b| b["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["a1", "a2"]);
+    let cycles = l.run.wake_cycles;
+    // sending to a1 failed on the limit, so neither was sent
+    let (out, changed) = unsent(&mut l, &ctx("2026-11-15T15:35:00-08:00"), &["a1".into(), "a2".into(), "a1".into()]).unwrap();
+    assert!(changed);
+    assert_eq!(out["then"], "tick");
+    assert_eq!(out["unsent"].as_array().unwrap().len(), 2);
+    let a1 = l.agent("a1").unwrap();
+    assert_eq!((a1.state, a1.resumes_tonight, a1.last_resumed.as_deref()), (State::StoppedByLimit, 1, Some("2026-11-15T10:34:00-08:00")));
+    let a2 = l.agent("a2").unwrap();
+    assert_eq!((a2.state, a2.resumes_tonight, a2.last_resumed.as_deref()), (State::StoppedByLimit, 0, None));
+    assert!(!l.run.herd_tripped);
+    assert_eq!(l.run.wake_cycles, cycles + 1);
+    assert!(l.log.iter().any(|e| e.msg.starts_with("unsent a1 (a1-stream): back to stopped-by-limit")));
+    // a later notice for them is not a refail: they are not running
+    let (st, _) = stopped(&mut l, &ctx("2026-11-15T15:36:00-08:00"), "a2", "usage limit reached").unwrap();
+    assert_eq!((st["ignored"].as_bool(), st["herd_tripped"].as_bool()), (Some(true), Some(false)));
+    // only running items of the latest batch are accepted, and a refusal changes nothing
+    let snapshot = l.clone();
+    assert!(unsent(&mut l, &ctx("2026-11-15T15:37:00-08:00"), &["a1".into()]).unwrap_err().contains("latest resume batch"));
+    assert!(unsent(&mut l, &ctx("2026-11-15T15:37:00-08:00"), &["a3".into()]).is_err());
+    assert!(unsent(&mut l, &ctx("2026-11-15T15:37:00-08:00"), &["zz".into()]).is_err());
+    assert_eq!(l, snapshot);
+}
+
+#[test]
+fn interrupted_batches_end_at_the_cycle_cap() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::StoppedByLimit)]);
+    l.run.max_resumes_per_agent = 100;
+    let mut token = armed(&mut l);
+    let mut at = t("2026-11-15T15:34:00-08:00");
+    for round in 0..10 {
+        let (out, _) = next(&mut l, &Ctx { now: at, zone: la() }, &token, &usage(2, R2), &small).unwrap();
+        if out["action"] == "herd-stop" {
+            assert!(round >= 2, "stopped too early: round {round}");
+            return;
+        }
+        assert_eq!(out["action"], "resume", "{out}");
+        unsent(&mut l, &Ctx { now: at + Duration::minutes(1), zone: la() }, &["a1".into()]).unwrap();
+        let (out, _) = tick(&mut l, &Ctx { now: at + Duration::minutes(1), zone: la() }, &usage(3, R2)).unwrap();
+        token = out["token"].as_str().unwrap().to_string();
+        at += Duration::minutes(3);
+    }
+    panic!("an endless loop of interrupted batches");
 }
 
 #[test]

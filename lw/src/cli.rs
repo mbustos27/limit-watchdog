@@ -2,7 +2,7 @@
 use serde_json::{Value, json};
 
 use crate::clock::{self, Ctx, Zone};
-use crate::engine::{self, NewAgent, Usage};
+use crate::engine::{self, Fields, NewAgent, Usage};
 use crate::ledger::{self, Kind, Ledger, Risk, State, Store, TimerKind, parse_word};
 use crate::reset;
 use crate::size;
@@ -43,8 +43,11 @@ global:  --ledger PATH   --session ID (else CLAUDE_CODE_SESSION_ID)   --now ISO 
   init [--project TEXT] [--unattended]
   add --id ID --name NAME --agent-type TYPE --kind resumable|redispatch --risk read-only|local-writes|irreversible
       [--worktree PATH] [--handoff PATH] [--brief-file PATH] [--resume TEXT]
+  add --id NEW --replaces OLD [any field above]   a re-dispatch: copies the rest and the resume count, sets OLD done
+  edit ID [--name] [--agent-type] [--kind] [--risk] [--worktree] [--handoff] [--brief-file] [--resume]
   set ID STATE [--note TEXT]           states: running stopped-by-limit stopped-by-weekly needs-human paused-by-user done
-  stopped ID --text \"<limit notice>\"   classify a limit failure
+  stopped ID --text \"<limit notice>\"   classify a limit failure (only a running agent changes state)
+  unsent ID...                         batch items that were not sent go back to stopped-by-limit; then run tick
   reset-time \"<text or ISO>\"           {reset, wake_at, cron, backup_at}
   tick --five-pct N --five-resets-at ISO [--weekly-pct N --weekly-resets-at ISO]
   next --token T --five-pct N --five-resets-at ISO [--weekly-pct N --weekly-resets-at ISO]
@@ -147,6 +150,23 @@ fn word_arg<T: serde::de::DeserializeOwned>(v: &str, what: &str, choices: &str) 
     parse_word(v, what, choices).map_err(Fail::Usage)
 }
 
+/// The agent fields `add` and `edit` take.
+const FIELD_OPTS: [&str; 8] = ["--name", "--agent-type", "--kind", "--risk", "--worktree", "--handoff", "--brief-file", "--resume"];
+
+fn fields(a: &Args) -> Result<Fields, Fail> {
+    let s = |k: &str| a.opt(k).map(String::from);
+    Ok(Fields {
+        name: s("--name"),
+        agent_type: s("--agent-type"),
+        kind: a.opt("--kind").map(|v| word_arg::<Kind>(v, "--kind", ledger::KINDS)).transpose()?,
+        risk: a.opt("--risk").map(|v| word_arg::<Risk>(v, "--risk", ledger::RISKS)).transpose()?,
+        worktree: s("--worktree"),
+        handoff: s("--handoff"),
+        brief_file: s("--brief-file"),
+        resume: s("--resume"),
+    })
+}
+
 fn pct(k: &str, v: &str) -> Result<u32, Fail> {
     let n: f64 = v.trim().trim_end_matches('%').parse().map_err(|_| Fail::Usage(format!("{k}: {v:?} is not a number")))?;
     if !n.is_finite() || !(0.0..=1000.0).contains(&n) {
@@ -230,23 +250,45 @@ pub fn run(argv: &[String]) -> Result<Output, Fail> {
             l.run.unattended = unattended;
             l.push_log(&ctx.now_str(), if unattended { "init (unattended)" } else { "init" });
             Store::new(p.clone()).create(&l)?;
-            let warning = if sid.is_empty() { json!("no session id: lw cannot find transcripts, so every agent would be re-dispatched") } else { Value::Null };
-            Ok(Output::Json(json!({ "ok": true, "ledger": p.display().to_string(), "session_id": sid, "host_session_id": host, "warning": warning })))
+            let mut warnings: Vec<String> = Vec::new();
+            if sid.is_empty() {
+                warnings.push("no session id: lw cannot find transcripts, so every agent would be re-dispatched".into());
+            }
+            if host.is_empty() {
+                warnings.push(format!(
+                    "{} is empty: the Desktop backup task cannot send_message this session, so only the in-session one-shot can wake it",
+                    ledger::HOST_SESSION_ENV
+                ));
+            }
+            for w in &warnings {
+                eprintln!("lw: warning: {w}");
+            }
+            Ok(Output::Json(json!({ "ok": true, "ledger": p.display().to_string(), "session_id": sid, "host_session_id": host, "warnings": warnings })))
         }
         "add" => {
-            a.check(&["--id", "--name", "--agent-type", "--kind", "--risk", "--worktree", "--handoff", "--brief-file", "--resume"], &[], 0, Some(0))?;
-            let na = NewAgent {
-                id: a.need("--id")?.trim().to_string(),
-                name: a.need("--name")?.to_string(),
-                agent_type: a.need("--agent-type")?.to_string(),
-                kind: word_arg::<Kind>(a.need("--kind")?, "--kind", ledger::KINDS)?,
-                risk: word_arg::<Risk>(a.need("--risk")?, "--risk", ledger::RISKS)?,
-                worktree: a.opt("--worktree").map(String::from),
-                handoff: a.opt("--handoff").map(String::from),
-                brief_file: a.opt("--brief-file").map(String::from),
-                resume: a.opt("--resume").map(String::from),
-            };
+            let mut opts = FIELD_OPTS.to_vec();
+            opts.extend(["--id", "--replaces"]);
+            a.check(&opts, &[], 0, Some(0))?;
+            let replaces = a.opt("--replaces").map(|s| s.trim().to_string());
+            if replaces.is_none() {
+                for k in ["--name", "--agent-type", "--kind", "--risk"] {
+                    a.need(k)?;
+                }
+            }
+            let na = NewAgent { id: a.need("--id")?.trim().to_string(), replaces, fields: fields(&a)? };
             change(&store()?, &ctx, |l| engine::add(l, &ctx, na))
+        }
+        "edit" => {
+            a.check(&FIELD_OPTS, &[], 1, Some(1))?;
+            if !FIELD_OPTS.iter().any(|k| a.opt(k).is_some()) {
+                return Err(Fail::Usage(format!("edit: give at least one of {}", FIELD_OPTS.join(" "))));
+            }
+            let f = fields(&a)?;
+            change(&store()?, &ctx, |l| engine::edit(l, &ctx, a.pos[1].trim(), f))
+        }
+        "unsent" => {
+            a.check(&[], &[], 1, None)?;
+            change(&store()?, &ctx, |l| engine::unsent(l, &ctx, &a.pos[1..]))
         }
         "set" => {
             a.check(&["--note"], &[], 2, Some(2))?;

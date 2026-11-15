@@ -29,14 +29,15 @@
       "agent_type": "general-purpose",
       "kind": "resumable",
       "risk": "local-writes",
-      "worktree": "C:\\Users\\moise\\Dev\\repo-wt\\bridge-tests",
-      "handoff": "C:\\Users\\moise\\Dev\\repo-wt\\bridge-tests\\HANDOFF.md",
-      "brief_file": "C:\\Users\\moise\\Dev\\repo-wt\\bridge-tests\\BRIEF.md",
+      "worktree": "C:\\src\\my-app-wt\\bridge-tests",
+      "handoff": "C:\\src\\my-app-wt\\bridge-tests\\HANDOFF.md",
+      "brief_file": "C:\\src\\my-app-wt\\bridge-tests\\BRIEF.md",
       "state": "stopped-by-limit",
       "resumes_tonight": 0,
       "last_resumed": null,
+      "prev_resumed": null,
       "last_failure": "5-hour limit at 2026-11-16T03:21:00-08:00, resets 2026-11-16T03:40:00-08:00",
-      "resume": "Resume from C:\\Users\\moise\\Dev\\repo-wt\\bridge-tests\\HANDOFF.md. Skip steps marked done; re-check any in-flight operation before retrying it."
+      "resume": "Resume from C:\\src\\my-app-wt\\bridge-tests\\HANDOFF.md. Skip steps marked done; re-check any in-flight operation before retrying it."
     },
     {
       "id": "a0000000000000002",
@@ -46,10 +47,11 @@
       "risk": "read-only",
       "worktree": null,
       "handoff": null,
-      "brief_file": "C:\\Users\\moise\\Dev\\repo-wt\\briefs\\find-callers.md",
+      "brief_file": "C:\\src\\my-app-wt\\briefs\\find-callers.md",
       "state": "stopped-by-limit",
       "resumes_tonight": 0,
       "last_resumed": null,
+      "prev_resumed": null,
       "last_failure": "5-hour limit at 2026-11-16T03:22:00-08:00, resets 2026-11-16T03:40:00-08:00",
       "resume": "Resume from HANDOFF.md. Skip steps marked done; re-check any in-flight operation before retrying it."
     },
@@ -59,14 +61,15 @@
       "agent_type": "general-purpose",
       "kind": "resumable",
       "risk": "irreversible",
-      "worktree": "C:\\Users\\moise\\Dev\\repo-wt\\release",
-      "handoff": "C:\\Users\\moise\\Dev\\repo-wt\\release\\HANDOFF.md",
-      "brief_file": "C:\\Users\\moise\\Dev\\repo-wt\\release\\BRIEF.md",
+      "worktree": "C:\\src\\my-app-wt\\release",
+      "handoff": "C:\\src\\my-app-wt\\release\\HANDOFF.md",
+      "brief_file": "C:\\src\\my-app-wt\\release\\BRIEF.md",
       "state": "running",
       "resumes_tonight": 0,
       "last_resumed": null,
+      "prev_resumed": null,
       "last_failure": null,
-      "resume": "Resume from C:\\Users\\moise\\Dev\\repo-wt\\release\\HANDOFF.md. Skip steps marked done; re-check any in-flight operation before retrying it."
+      "resume": "Resume from C:\\src\\my-app-wt\\release\\HANDOFF.md. Skip steps marked done; re-check any in-flight operation before retrying it."
     }
   ],
   "wake": {
