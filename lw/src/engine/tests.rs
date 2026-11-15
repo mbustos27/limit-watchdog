@@ -1,0 +1,549 @@
+use super::*;
+use crate::clock::{Zone, named, parse_instant};
+use crate::ledger::{Agent, Kind, Ledger, Reason, Risk, State, TimerKind};
+
+fn la() -> Zone {
+    named("America/Los_Angeles").unwrap()
+}
+fn ctx(now: &str) -> Ctx {
+    Ctx { now: parse_instant(now, &la()).unwrap(), zone: la() }
+}
+fn t(s: &str) -> DateTime<Utc> {
+    parse_instant(s, &la()).unwrap()
+}
+fn agent(id: &str, risk: Risk, state: State) -> Agent {
+    Agent {
+        id: id.into(),
+        name: format!("{id}-stream"),
+        agent_type: "general-purpose".into(),
+        kind: Kind::Resumable,
+        risk,
+        worktree: Some(format!("C:\\wt\\{id}")),
+        handoff: Some(format!("C:\\wt\\{id}\\HANDOFF.md")),
+        brief_file: Some(format!("C:\\wt\\{id}\\BRIEF.md")),
+        state,
+        resumes_tonight: 0,
+        last_resumed: None,
+        last_failure: None,
+        resume: default_resume(Some("HANDOFF.md")),
+    }
+}
+fn ledger(agents: Vec<Agent>) -> Ledger {
+    let mut l = Ledger::new("sess", "local_host", "proj", "2026-11-15T10:00:00-08:00");
+    l.run.unattended = true;
+    l.agents = agents;
+    l
+}
+fn usage(five: u32, reset: &str) -> Usage {
+    Usage { five_pct: five, five_resets_at: t(reset), weekly: None }
+}
+fn weekly(five: u32, reset: &str, w: u32, wreset: &str) -> Usage {
+    Usage { five_pct: five, five_resets_at: t(reset), weekly: Some((w, t(wreset))) }
+}
+fn small(_: &Agent) -> Option<u64> {
+    Some(1_000)
+}
+const R1: &str = "2026-11-15T15:30:00.194-08:00";
+const R2: &str = "2026-11-15T20:30:00-08:00";
+
+/// Arm a wall wake for R1 from a running agent at 85 % and record its two timers; returns the token.
+fn armed(l: &mut Ledger) -> String {
+    let (out, _) = tick(l, &ctx("2026-11-15T14:00:00-08:00"), &usage(85, R1)).unwrap();
+    assert_eq!(out["action"], "arm", "{out}");
+    let token = out["token"].as_str().unwrap().to_string();
+    let c = ctx("2026-11-15T14:00:10-08:00");
+    timer_add(l, &c, TimerKind::CronOneshot, "cron-1", t("2026-11-15T15:34:00-08:00"), &token).unwrap();
+    timer_add(l, &c, TimerKind::DesktopTask, "task-1", t("2026-11-15T15:40:00-08:00"), &token).unwrap();
+    token
+}
+
+// ------------------------------------------------------------------------------------------------ tick
+
+#[test]
+fn tick_arms_once_then_is_idempotent() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::Running)]);
+    let c = ctx("2026-11-15T14:00:00-08:00");
+    let (out, changed) = tick(&mut l, &c, &usage(85, R1)).unwrap();
+    assert!(changed);
+    assert_eq!(out["action"], "arm");
+    assert_eq!(out["stop_launching"], true);
+    assert_eq!(out["token"], "w1");
+    assert_eq!(out["cron"], "34 15 15 11 *");
+    assert_eq!(out["wake_at"], "2026-11-15T15:34:00-08:00");
+    assert_eq!(out["backup_at"], "2026-11-15T15:40:00-08:00");
+    assert_eq!(out["for_reset"], "2026-11-15T15:30:00-08:00");
+    assert!(out["toast"].as_str().unwrap().contains("15:34"));
+    let snapshot = l.clone();
+    // same reset (milliseconds drift), higher usage: nothing changes
+    let (again, changed) = tick(&mut l, &ctx("2026-11-15T14:20:00-08:00"), &usage(93, "2026-11-15T23:30:00.201Z")).unwrap();
+    assert!(!changed);
+    assert_eq!(again["action"], "armed");
+    assert_eq!(again["token"], "w1");
+    assert_eq!(again["cron"], "34 15 15 11 *");
+    assert_eq!(l, snapshot);
+}
+
+#[test]
+fn tick_is_ok_below_the_threshold_and_never_arms_without_agents() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::Running)]);
+    let (out, changed) = tick(&mut l, &ctx("2026-11-15T14:00:00-08:00"), &usage(50, R1)).unwrap();
+    assert_eq!((out["action"].as_str(), out["stop_launching"].as_bool(), changed), (Some("ok"), Some(false), false));
+    let mut idle = ledger(vec![agent("a1", Risk::LocalWrites, State::Done)]);
+    let (out, changed) = tick(&mut idle, &ctx("2026-11-15T14:00:00-08:00"), &usage(95, R1)).unwrap();
+    assert_eq!((out["action"].as_str(), out["stop_launching"].as_bool(), changed), (Some("ok"), Some(true), false));
+    assert!(idle.wake.is_none());
+}
+
+#[test]
+fn tick_arms_on_a_limit_failure_even_below_the_threshold() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::StoppedByLimit)]);
+    let (out, _) = tick(&mut l, &ctx("2026-11-15T14:00:00-08:00"), &usage(40, R1)).unwrap();
+    assert_eq!(out["action"], "arm");
+}
+
+#[test]
+fn tick_warns_on_weekly_usage() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::Running)]);
+    let (out, changed) = tick(&mut l, &ctx("2026-11-15T14:00:00-08:00"), &weekly(50, R1, 91, "2026-11-17T00:00:00-08:00")).unwrap();
+    assert!(!changed);
+    assert_eq!(out["action"], "weekly-warn");
+    assert_eq!(out["stop_launching"], true);
+    assert_eq!(out["weekly_pct"], 91);
+    // when it also arms, the arm wins and carries the warning
+    let (out, _) = tick(&mut l, &ctx("2026-11-15T14:00:00-08:00"), &weekly(85, R1, 91, "2026-11-17T00:00:00-08:00")).unwrap();
+    assert_eq!(out["action"], "arm");
+    assert_eq!(out["weekly_warn"], true);
+}
+
+#[test]
+fn tick_arms_again_for_a_different_reset_and_drops_the_old_timers() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::Running)]);
+    armed(&mut l);
+    let (out, changed) = tick(&mut l, &ctx("2026-11-15T16:00:00-08:00"), &usage(85, R2)).unwrap();
+    assert!(changed);
+    assert_eq!(out["action"], "arm");
+    assert_eq!(out["token"], "w2");
+    assert_eq!(out["delete_timers"], json!(["cron-1", "task-1"]));
+    assert!(l.timers.is_empty());
+}
+
+// ------------------------------------------------------------------------------------------------ next: dedup, still limited
+
+#[test]
+fn next_dedups_the_second_timer_and_unknown_tokens() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::StoppedByLimit)]);
+    let token = armed(&mut l);
+    let c = ctx("2026-11-15T15:34:05-08:00");
+    let (first, changed) = next(&mut l, &c, &token, &usage(3, R2), &small).unwrap();
+    assert!(changed);
+    assert_eq!(first["action"], "resume");
+    let snapshot = l.clone();
+    // the Desktop backup with the same token, a little later
+    let (second, changed) = next(&mut l, &ctx("2026-11-15T15:40:05-08:00"), &token, &usage(5, R2), &small).unwrap();
+    assert!(!changed);
+    assert_eq!(second["action"], "already-handled");
+    let (other, changed) = next(&mut l, &c, "w99", &usage(5, R2), &small).unwrap();
+    assert!(!changed);
+    assert_eq!(other["action"], "already-handled");
+    assert_eq!(l, snapshot);
+}
+
+#[test]
+fn next_still_limited_rearms_until_the_cycle_cap_then_stops() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::StoppedByLimit)]);
+    let w1 = armed(&mut l);
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(100, R2), &small).unwrap();
+    assert_eq!(out["action"], "still-limited");
+    assert_eq!(out["token"], "w2");
+    assert_eq!(out["for_reset"], "2026-11-15T20:30:00-08:00");
+    assert_eq!(out["wake_at"], "2026-11-15T20:34:00-08:00");
+    assert_eq!(out["delete_timers"], json!(["cron-1", "task-1"]));
+    assert_eq!(l.run.wake_cycles, 1);
+    assert_eq!(l.wake.as_ref().unwrap().reason, Reason::Wall);
+    let (out, _) = next(&mut l, &ctx("2026-11-15T20:34:00-08:00"), "w2", &usage(100, "2026-11-16T01:30:00-08:00"), &small).unwrap();
+    assert_eq!((out["action"].as_str(), out["token"].as_str()), (Some("still-limited"), Some("w3")));
+    let (out, _) = next(&mut l, &ctx("2026-11-16T01:34:00-08:00"), "w3", &usage(100, "2026-11-16T06:30:00-08:00"), &small).unwrap();
+    assert_eq!(out["action"], "herd-stop");
+    assert!(out["reason"].as_str().unwrap().contains("3 wake cycles"), "{out}");
+    assert!(l.run.herd_tripped);
+    assert_eq!(l.agents[0].state, State::StoppedByLimit);
+}
+
+// ------------------------------------------------------------------------------------------------ next: weekly
+
+#[test]
+fn next_weekly_stop_marks_agents_and_sets_a_notice_wake() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::StoppedByLimit), agent("a2", Risk::ReadOnly, State::StoppedByLimit)]);
+    let w1 = armed(&mut l);
+    let (out, changed) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &weekly(2, R2, 93, "2026-11-16T23:45:00-08:00"), &small).unwrap();
+    assert!(changed);
+    assert_eq!(out["action"], "weekly-stop");
+    assert_eq!(out["weekly_resets_at"], "2026-11-16T23:45:00-08:00");
+    // reset + 15 lands on :00 -> :01
+    assert_eq!(out["notify_at"], "2026-11-17T00:01:00-08:00");
+    assert_eq!(out["agents"], json!(["a1", "a2"]));
+    assert!(l.agents.iter().all(|a| a.state == State::StoppedByWeekly));
+    let w = l.wake.as_ref().unwrap();
+    assert_eq!((w.reason, w.token.as_str()), (Reason::Weekly, "w2"));
+    // the notice wake only tells the person
+    let (out, _) =
+        next(&mut l, &ctx("2026-11-17T00:01:00-08:00"), "w2", &weekly(0, "2026-11-17T05:00:00-08:00", 0, "2026-11-23T23:45:00-08:00"), &small).unwrap();
+    assert_eq!(out["action"], "weekly-reset");
+    assert_eq!(out["waiting"], 2);
+    assert!(l.wake.is_none());
+    assert!(l.agents.iter().all(|a| a.state == State::StoppedByWeekly));
+}
+
+#[test]
+fn weekly_at_100_stops_even_when_resuming_after_weekly_is_allowed() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::StoppedByLimit)]);
+    l.run.resume_after_weekly = true;
+    let w1 = armed(&mut l);
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &weekly(2, R2, 100, "2026-11-16T12:00:00-08:00"), &small).unwrap();
+    assert_eq!(out["action"], "weekly-stop");
+    // at 93 % with resume_after_weekly it carries on
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::StoppedByLimit)]);
+    l.run.resume_after_weekly = true;
+    let w1 = armed(&mut l);
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &weekly(2, R2, 93, "2026-11-16T12:00:00-08:00"), &small).unwrap();
+    assert_eq!(out["action"], "resume");
+}
+
+// ------------------------------------------------------------------------------------------------ next: herd guard
+
+#[test]
+fn herd_stop_when_a_resumed_agent_fails_again() {
+    let mut l = ledger(vec![
+        agent("a1", Risk::LocalWrites, State::StoppedByLimit),
+        agent("a2", Risk::LocalWrites, State::StoppedByLimit),
+        agent("a3", Risk::LocalWrites, State::StoppedByLimit),
+    ]);
+    let w1 = armed(&mut l);
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(2, R2), &small).unwrap();
+    assert_eq!(out["action"], "resume");
+    let batch_token = out["arm"]["token"].as_str().unwrap().to_string();
+    // a1 dies on the limit again 10 minutes after its resume
+    let (st, _) = stopped(&mut l, &ctx("2026-11-15T15:44:00-08:00"), "a1", "You've hit your 5-hour limit \u{b7} resets 8:30pm").unwrap();
+    assert_eq!(st["herd_tripped"], true);
+    assert!(st["toast"].as_str().unwrap().contains("Herd guard"));
+    assert!(l.run.herd_tripped);
+    // the pending batch wake stops instead of resuming more
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:46:00-08:00"), &batch_token, &usage(10, R2), &small).unwrap();
+    assert_eq!(out["action"], "herd-stop");
+    assert!(out["reason"].as_str().unwrap().contains("failed on the limit again"));
+    // and tick does not arm while the guard is tripped
+    let (out, changed) = tick(&mut l, &ctx("2026-11-15T15:50:00-08:00"), &usage(85, R2)).unwrap();
+    assert_eq!((out["action"].as_str(), changed), (Some("herd-stopped"), false));
+}
+
+#[test]
+fn a_failure_long_after_a_resume_does_not_trip_the_guard() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::Running)]);
+    l.agents[0].last_resumed = Some("2026-11-15T14:00:00-08:00".into());
+    let (st, _) = stopped(&mut l, &ctx("2026-11-15T14:45:00-08:00"), "a1", "5-hour limit reached").unwrap();
+    assert_eq!(st["herd_tripped"], false);
+    assert!(!l.run.herd_tripped);
+}
+
+#[test]
+fn herd_stop_when_usage_rises_too_fast_since_the_wake() {
+    let agents = (1..=5).map(|i| agent(&format!("a{i}"), Risk::LocalWrites, State::StoppedByLimit)).collect();
+    let mut l = ledger(agents);
+    let w1 = armed(&mut l);
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(10, R2), &small).unwrap();
+    assert_eq!(l.run.cycle_base_pct, Some(10));
+    let w2 = out["arm"]["token"].as_str().unwrap().to_string();
+    // 30 is exactly 20 points up: allowed
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:47:00-08:00"), &w2, &usage(30, R2), &small).unwrap();
+    assert_eq!(out["action"], "resume");
+    let w3 = out["arm"]["token"].as_str().unwrap().to_string();
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:59:00-08:00"), &w3, &usage(31, R2), &small).unwrap();
+    assert_eq!(out["action"], "herd-stop");
+    assert!(out["reason"].as_str().unwrap().contains("rose from 10% to 31%"), "{out}");
+}
+
+#[test]
+fn herd_stop_past_the_wake_cycle_cap() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::StoppedByLimit)]);
+    l.run.wake_cycles = 3;
+    let w1 = armed(&mut l);
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(2, R2), &small).unwrap();
+    assert_eq!(out["action"], "herd-stop");
+    assert!(out["reason"].as_str().unwrap().contains("4 wake cycles"), "{out}");
+    assert_eq!(out["delete_timers"], json!(["cron-1", "task-1"]));
+    assert!(l.timers.is_empty());
+    assert!(l.wake.as_ref().unwrap().handled_at.is_some());
+}
+
+// ------------------------------------------------------------------------------------------------ next: needs-human, batches
+
+#[test]
+fn irreversible_agents_and_the_resume_cap_go_to_a_person() {
+    let mut capped = agent("a2", Risk::LocalWrites, State::StoppedByLimit);
+    capped.resumes_tonight = 2;
+    let mut l = ledger(vec![agent("a1", Risk::Irreversible, State::StoppedByLimit), capped, agent("a3", Risk::LocalWrites, State::StoppedByLimit)]);
+    let w1 = armed(&mut l);
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(2, R2), &small).unwrap();
+    assert_eq!(out["action"], "resume");
+    let nh: Vec<&str> = out["needs_human"].as_array().unwrap().iter().map(|n| n["id"].as_str().unwrap()).collect();
+    assert_eq!(nh, ["a1", "a2"]);
+    assert_eq!(out["batch"].as_array().unwrap().len(), 1);
+    assert_eq!(out["batch"][0]["id"], "a3");
+    assert_eq!(l.agents[0].state, State::NeedsHuman);
+    assert_eq!(l.agents[1].state, State::NeedsHuman);
+    assert!(out["toast"].as_str().unwrap().contains("Needs you"));
+}
+
+#[test]
+fn batches_go_read_only_first_then_smallest_and_respect_size_and_concurrency() {
+    let mut explore = agent("e1", Risk::ReadOnly, State::StoppedByLimit);
+    explore.agent_type = "Explore".into();
+    explore.kind = Kind::Redispatch;
+    let mut l = ledger(vec![
+        agent("lw-small", Risk::LocalWrites, State::StoppedByLimit),
+        agent("ro-big", Risk::ReadOnly, State::StoppedByLimit),
+        agent("lw-big", Risk::LocalWrites, State::StoppedByLimit),
+        agent("ro-small", Risk::ReadOnly, State::StoppedByLimit),
+        explore,
+        agent("busy1", Risk::LocalWrites, State::Running),
+        agent("busy2", Risk::LocalWrites, State::Running),
+        agent("busy3", Risk::LocalWrites, State::Running),
+    ]);
+    let sizes = |a: &Agent| -> Option<u64> {
+        match a.id.as_str() {
+            "lw-small" => Some(500),
+            "ro-big" => Some(5_000_000),
+            "lw-big" => Some(2_000_000),
+            "ro-small" => Some(800),
+            _ => Some(100),
+        }
+    };
+    let w1 = armed(&mut l);
+    // 3 running of max 4: one slot
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(2, R2), &sizes).unwrap();
+    let ids: Vec<&str> = out["batch"].as_array().unwrap().iter().map(|b| b["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["e1"]);
+    assert_eq!(out["batch"][0]["mode"], "redispatch");
+    assert_eq!(out["remaining"], 4);
+    assert_eq!(out["arm"]["token"], "w2");
+    // gap 12 min: 15:46
+    assert_eq!(out["arm"]["wake_at"], "2026-11-15T15:46:00-08:00");
+    assert_eq!(out["arm"]["cron"], "46 15 15 11 *");
+    assert_eq!(out["delete_timers"], json!(["cron-1", "task-1"]));
+    assert_eq!(l.wake.as_ref().unwrap().reason, Reason::Batch);
+    // the busy ones finish; the next batch takes two: read-only by size, then local writes
+    for b in ["busy1", "busy2", "busy3", "e1"] {
+        set(&mut l, &ctx("2026-11-15T15:40:00-08:00"), b, State::Done, None).unwrap();
+    }
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:46:00-08:00"), "w2", &usage(8, R2), &sizes).unwrap();
+    let modes: Vec<(&str, &str)> = out["batch"].as_array().unwrap().iter().map(|b| (b["id"].as_str().unwrap(), b["mode"].as_str().unwrap())).collect();
+    assert_eq!(modes, [("ro-small", "resume"), ("ro-big", "redispatch")]);
+    assert_eq!(out["remaining"], 2);
+    assert_eq!(out["batch"][0]["resume"], default_resume(Some("HANDOFF.md")));
+    assert_eq!(out["batch"][0]["brief_file"], "C:\\wt\\ro-small\\BRIEF.md");
+    let ro_small = l.agent("ro-small").unwrap();
+    assert_eq!((ro_small.state, ro_small.resumes_tonight), (State::Running, 1));
+    assert_eq!(ro_small.last_resumed.as_deref(), Some("2026-11-15T15:46:00-08:00"));
+    // a batch wake does not count as a wake cycle
+    assert_eq!(l.run.wake_cycles, 1);
+}
+
+#[test]
+fn a_full_house_resumes_nobody_and_tries_again_later() {
+    let mut l = ledger(vec![
+        agent("a1", Risk::LocalWrites, State::StoppedByLimit),
+        agent("r1", Risk::LocalWrites, State::Running),
+        agent("r2", Risk::LocalWrites, State::Running),
+        agent("r3", Risk::LocalWrites, State::Running),
+        agent("r4", Risk::LocalWrites, State::Running),
+    ]);
+    let w1 = armed(&mut l);
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(2, R2), &small).unwrap();
+    assert_eq!(out["action"], "resume");
+    assert_eq!(out["batch"], json!([]));
+    assert_eq!(out["remaining"], 1);
+    assert!(out["arm"]["token"].is_string());
+}
+
+#[test]
+fn a_missing_transcript_means_redispatch() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::StoppedByLimit)]);
+    let w1 = armed(&mut l);
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(2, R2), &|_| None).unwrap();
+    assert_eq!(out["batch"][0]["mode"], "redispatch");
+    assert_eq!(out["batch"][0]["transcript_bytes"], Value::Null);
+}
+
+#[test]
+fn done_clears_timers_and_the_wake() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::Running)]);
+    let w1 = armed(&mut l);
+    set(&mut l, &ctx("2026-11-15T15:00:00-08:00"), "a1", State::Done, Some("finished before the wall")).unwrap();
+    let (out, changed) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(2, R2), &small).unwrap();
+    assert!(changed);
+    assert_eq!(out["action"], "done");
+    assert_eq!(out["delete_timers"], json!(["cron-1", "task-1"]));
+    assert!(l.timers.is_empty());
+    assert!(l.wake.is_none());
+    // the backup timer then finds nothing
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:40:00-08:00"), &w1, &usage(2, R2), &small).unwrap();
+    assert_eq!(out["action"], "already-handled");
+}
+
+#[test]
+fn the_last_batch_drops_the_handled_wakes_timers() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::StoppedByLimit)]);
+    let w1 = armed(&mut l);
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(2, R2), &small).unwrap();
+    assert_eq!(out["remaining"], 0);
+    assert_eq!(out["arm"], Value::Null);
+    assert_eq!(out["delete_timers"], json!(["cron-1", "task-1"]));
+    assert!(l.timers.is_empty());
+}
+
+// ------------------------------------------------------------------------------------------------ wake-status, stopped, add, set, run-set, migrate
+
+#[test]
+fn wake_status_reads_without_consuming() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::StoppedByLimit)]);
+    let w1 = armed(&mut l);
+    let s = wake_status(&l, &w1);
+    assert_eq!((s["handled"].as_bool(), s["current"].as_bool(), s["pending_agents"].as_u64()), (Some(false), Some(true), Some(1)));
+    assert_eq!(s["host_session_id"], "local_host");
+    let s = wake_status(&l, "w42");
+    assert_eq!((s["handled"].as_bool(), s["current"].as_bool()), (Some(true), Some(false)));
+    next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(2, R2), &small).unwrap();
+    assert_eq!(wake_status(&l, &w1)["handled"], true);
+}
+
+#[test]
+fn stopped_classifies_the_notice() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::Running), agent("a2", Risk::LocalWrites, State::Running)]);
+    let c = ctx("2026-11-15T14:00:00-08:00");
+    let (out, _) = stopped(&mut l, &c, "a1", "You've hit your 5-hour limit \u{b7} resets 3:30pm (America/Los_Angeles)").unwrap();
+    assert_eq!(out["state"], "stopped-by-limit");
+    assert_eq!(out["reset"]["reset"], "2026-11-15T15:30:00-08:00");
+    assert_eq!(out["reset"]["wake_at"], "2026-11-15T15:34:00-08:00");
+    assert!(l.agents[0].last_failure.as_deref().unwrap().contains("resets 2026-11-15T15:30:00-08:00"));
+    let (out, _) = stopped(&mut l, &c, "a2", "You've hit your weekly limit \u{b7} resets Mon 12:00am").unwrap();
+    assert_eq!(out["state"], "stopped-by-weekly");
+    assert_eq!(out["reset"]["reset"], "2026-11-16T00:00:00-08:00");
+    assert!(stopped(&mut l, &c, "a1", "API Error: 500 internal server error").is_err());
+    assert!(stopped(&mut l, &c, "nobody", "5-hour limit reached").is_err());
+    // a notice without a readable reset still records the stop
+    let (out, _) = stopped(&mut l, &c, "a1", "Agent was stopped by a usage limit").unwrap();
+    assert_eq!((out["state"].as_str(), out["reset"].is_null()), (Some("stopped-by-limit"), true));
+}
+
+#[test]
+fn add_validates_and_forces_redispatch_for_explore_and_plan() {
+    let mut l = ledger(vec![]);
+    let c = ctx("2026-11-15T14:00:00-08:00");
+    let na = |id: &str, ty: &str| NewAgent {
+        id: id.into(),
+        name: "stream".into(),
+        agent_type: ty.into(),
+        kind: Kind::Resumable,
+        risk: Risk::ReadOnly,
+        worktree: None,
+        handoff: Some("C:\\wt\\HANDOFF.md".into()),
+        brief_file: None,
+        resume: None,
+    };
+    let (out, _) = add(&mut l, &c, na("x1", "Explore")).unwrap();
+    assert_eq!(out["agent"]["kind"], "redispatch");
+    assert!(out["note"].is_string());
+    assert_eq!(out["agent"]["state"], "running");
+    assert_eq!(out["agent"]["resume"], "Resume from C:\\wt\\HANDOFF.md. Skip steps marked done; re-check any in-flight operation before retrying it.");
+    let (out, _) = add(&mut l, &c, na("x2", "plan")).unwrap();
+    assert_eq!(out["agent"]["kind"], "redispatch");
+    let (out, _) = add(&mut l, &c, na("x3", "general-purpose")).unwrap();
+    assert_eq!(out["agent"]["kind"], "resumable");
+    assert!(add(&mut l, &c, na("x3", "general-purpose")).unwrap_err().contains("already"));
+    assert!(add(&mut l, &c, na("../x", "general-purpose")).is_err());
+}
+
+#[test]
+fn set_logs_the_change() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::Running)]);
+    let (out, _) = set(&mut l, &ctx("2026-11-15T14:00:00-08:00"), "a1", State::PausedByUser, Some("user asked")).unwrap();
+    assert_eq!((out["from"].as_str(), out["state"].as_str()), (Some("running"), Some("paused-by-user")));
+    assert!(l.log.last().unwrap().msg.ends_with("running -> paused-by-user: user asked"));
+    assert!(set(&mut l, &ctx("2026-11-15T14:00:00-08:00"), "zz", State::Done, None).is_err());
+}
+
+#[test]
+fn run_set_validates_keys_and_values() {
+    let mut l = ledger(vec![]);
+    let c = ctx("2026-11-15T14:00:00-08:00");
+    let (out, changed) = run_set(&mut l, &c, "batch-size", "3").unwrap();
+    assert!(changed);
+    assert_eq!((out["from"].as_u64(), out["value"].as_u64()), (Some(2), Some(3)));
+    assert_eq!(l.run.batch_size, 3);
+    run_set(&mut l, &c, "herd_tripped", "true").unwrap();
+    assert!(l.run.herd_tripped);
+    run_set(&mut l, &c, "cycle_base_pct", "40").unwrap();
+    assert_eq!(l.run.cycle_base_pct, Some(40));
+    run_set(&mut l, &c, "cycle_base_pct", "null").unwrap();
+    assert_eq!(l.run.cycle_base_pct, None);
+    let (_, changed) = run_set(&mut l, &c, "batch_size", "3").unwrap();
+    assert!(!changed);
+    for (k, v) in [
+        ("arm_at_pct", "0"),
+        ("arm_at_pct", "101"),
+        ("max_concurrent", "0"),
+        ("unattended", "maybe"),
+        ("nope", "1"),
+        ("wake_seq", "1"),
+        ("batch_gap_min", "-1"),
+    ] {
+        assert!(run_set(&mut l, &c, k, v).is_err(), "{k}={v}");
+    }
+}
+
+#[test]
+fn new_night_resets_the_counters() {
+    let mut a = agent("a1", Risk::LocalWrites, State::Running);
+    a.resumes_tonight = 2;
+    let mut l = ledger(vec![a]);
+    l.run.wake_cycles = 3;
+    l.run.herd_tripped = true;
+    l.run.cycle_base_pct = Some(50);
+    new_night(&mut l, &ctx("2026-11-16T09:00:00-08:00")).unwrap();
+    assert_eq!((l.run.wake_cycles, l.run.herd_tripped, l.run.cycle_base_pct, l.agents[0].resumes_tonight), (0, false, None, 0));
+}
+
+#[test]
+fn migrate_v1_converts_the_old_fields() {
+    let v1 = r#"{"agents":[
+        {"id":"a1","stream":"bridge tests","worktree":"C:\\wt\\a1","state":"stopped-by-limit","resume":"Carry on."},
+        {"id":"a2","stream":"docs","state":"sleeping"},
+        {"stream":"no id"}
+    ]}"#;
+    let (l, notes) = migrate_v1(v1, &ctx("2026-11-15T14:00:00-08:00"), "old.json", "sess", "local_h").unwrap();
+    assert_eq!(l.version, 2);
+    assert_eq!(l.agents.len(), 2);
+    let a1 = &l.agents[0];
+    assert_eq!(
+        (a1.name.as_str(), a1.kind, a1.risk, a1.agent_type.as_str(), a1.state),
+        ("bridge tests", Kind::Resumable, Risk::LocalWrites, "", State::StoppedByLimit)
+    );
+    assert_eq!(a1.resume, "Carry on.");
+    assert_eq!(a1.worktree.as_deref(), Some("C:\\wt\\a1"));
+    assert_eq!(l.agents[1].state, State::NeedsHuman);
+    assert_eq!(l.agents[1].resume, default_resume(None));
+    assert_eq!(notes.len(), 2);
+    // a bare list works too; a v2 file is refused
+    assert_eq!(migrate_v1(r#"[{"id":"b1","stream":"s","state":"running"}]"#, &ctx("2026-11-15T14:00:00-08:00"), "x", "s", "h").unwrap().0.agents.len(), 1);
+    assert!(migrate_v1(r#"{"version":2,"agents":[]}"#, &ctx("2026-11-15T14:00:00-08:00"), "x", "s", "h").is_err());
+}
+
+#[test]
+fn summary_mentions_the_essentials() {
+    let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::StoppedByLimit)]);
+    armed(&mut l);
+    let s = summary(&l, "C:\\x.json");
+    for needle in ["w1 (wall)", "cron-oneshot cron-1", "1 stopped-by-limit", "a1-stream", "unattended"] {
+        assert!(s.contains(needle), "{needle}\n{s}");
+    }
+}

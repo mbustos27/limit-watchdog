@@ -1,0 +1,2 @@
+# The GNU toolchain needs WinLibs (dlltool, gcc) on PATH; gate.ps1 adds it.
+[build]

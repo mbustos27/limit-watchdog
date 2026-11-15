@@ -1,0 +1,132 @@
+{
+  "version": 2,
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "host_session_id": "local_00000000-0000-0000-0000-000000000000",
+  "project": "Example project (C:\\path\\to\\repo)",
+  "updated": "2026-11-16T03:22:00-08:00",
+  "run": {
+    "unattended": true,
+    "max_concurrent": 4,
+    "batch_size": 2,
+    "batch_gap_min": 12,
+    "max_wake_cycles": 3,
+    "wake_cycles": 0,
+    "max_resumes_per_agent": 2,
+    "arm_at_pct": 80,
+    "herd_rise_pct": 20,
+    "herd_refail_min": 30,
+    "weekly_stop_pct": 90,
+    "redispatch_over_bytes": 3000000,
+    "resume_after_weekly": false,
+    "cycle_base_pct": null,
+    "herd_tripped": false,
+    "wake_seq": 1
+  },
+  "agents": [
+    {
+      "id": "a0000000000000001",
+      "name": "bridge-tests",
+      "agent_type": "general-purpose",
+      "kind": "resumable",
+      "risk": "local-writes",
+      "worktree": "C:\\Users\\moise\\Dev\\repo-wt\\bridge-tests",
+      "handoff": "C:\\Users\\moise\\Dev\\repo-wt\\bridge-tests\\HANDOFF.md",
+      "brief_file": "C:\\Users\\moise\\Dev\\repo-wt\\bridge-tests\\BRIEF.md",
+      "state": "stopped-by-limit",
+      "resumes_tonight": 0,
+      "last_resumed": null,
+      "last_failure": "5-hour limit at 2026-11-16T03:21:00-08:00, resets 2026-11-16T03:40:00-08:00",
+      "resume": "Resume from C:\\Users\\moise\\Dev\\repo-wt\\bridge-tests\\HANDOFF.md. Skip steps marked done; re-check any in-flight operation before retrying it."
+    },
+    {
+      "id": "a0000000000000002",
+      "name": "find-callers",
+      "agent_type": "Explore",
+      "kind": "redispatch",
+      "risk": "read-only",
+      "worktree": null,
+      "handoff": null,
+      "brief_file": "C:\\Users\\moise\\Dev\\repo-wt\\briefs\\find-callers.md",
+      "state": "stopped-by-limit",
+      "resumes_tonight": 0,
+      "last_resumed": null,
+      "last_failure": "5-hour limit at 2026-11-16T03:22:00-08:00, resets 2026-11-16T03:40:00-08:00",
+      "resume": "Resume from HANDOFF.md. Skip steps marked done; re-check any in-flight operation before retrying it."
+    },
+    {
+      "id": "a0000000000000003",
+      "name": "release-push",
+      "agent_type": "general-purpose",
+      "kind": "resumable",
+      "risk": "irreversible",
+      "worktree": "C:\\Users\\moise\\Dev\\repo-wt\\release",
+      "handoff": "C:\\Users\\moise\\Dev\\repo-wt\\release\\HANDOFF.md",
+      "brief_file": "C:\\Users\\moise\\Dev\\repo-wt\\release\\BRIEF.md",
+      "state": "running",
+      "resumes_tonight": 0,
+      "last_resumed": null,
+      "last_failure": null,
+      "resume": "Resume from C:\\Users\\moise\\Dev\\repo-wt\\release\\HANDOFF.md. Skip steps marked done; re-check any in-flight operation before retrying it."
+    }
+  ],
+  "wake": {
+    "token": "w1",
+    "reason": "wall",
+    "for_reset": "2026-11-16T03:40:00-08:00",
+    "wake_at": "2026-11-16T03:44:00-08:00",
+    "backup_at": "2026-11-16T03:50:00-08:00",
+    "handled_at": null
+  },
+  "timers": [
+    {
+      "kind": "cron-oneshot",
+      "id": "3f9c2a1b",
+      "fires": "2026-11-16T03:44:00-08:00",
+      "token": "w1"
+    },
+    {
+      "kind": "desktop-task",
+      "id": "limit-watchdog-w1",
+      "fires": "2026-11-16T03:50:00-08:00",
+      "token": "w1"
+    }
+  ],
+  "log": [
+    {
+      "at": "2026-11-15T22:10:00-08:00",
+      "msg": "init (unattended)"
+    },
+    {
+      "at": "2026-11-15T22:12:00-08:00",
+      "msg": "added a0000000000000001 (bridge-tests): general-purpose resumable local-writes"
+    },
+    {
+      "at": "2026-11-15T22:13:00-08:00",
+      "msg": "added a0000000000000002 (find-callers): Explore redispatch read-only"
+    },
+    {
+      "at": "2026-11-15T22:14:00-08:00",
+      "msg": "added a0000000000000003 (release-push): general-purpose resumable irreversible"
+    },
+    {
+      "at": "2026-11-16T01:05:00-08:00",
+      "msg": "armed w1 (wall) at 5-hour 82%, weekly 41%: wake 2026-11-16T03:44:00-08:00, backup 2026-11-16T03:50:00-08:00, for the 2026-11-16T03:40:00-08:00 reset"
+    },
+    {
+      "at": "2026-11-16T01:06:00-08:00",
+      "msg": "timer cron-oneshot 3f9c2a1b fires 2026-11-16T03:44:00-08:00 for w1"
+    },
+    {
+      "at": "2026-11-16T01:06:30-08:00",
+      "msg": "timer desktop-task limit-watchdog-w1 fires 2026-11-16T03:50:00-08:00 for w1"
+    },
+    {
+      "at": "2026-11-16T03:21:00-08:00",
+      "msg": "stopped a0000000000000001 (bridge-tests): 5-hour limit"
+    },
+    {
+      "at": "2026-11-16T03:22:00-08:00",
+      "msg": "stopped a0000000000000002 (find-callers): 5-hour limit"
+    }
+  ]
+}
