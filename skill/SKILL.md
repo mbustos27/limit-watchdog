@@ -68,6 +68,7 @@ An `arm` returns `token`, `reason`, `cron`, `wake_at`, `backup_at` and `for_rese
    Then run `lw timer-add --kind cron-oneshot --id <job id> --fires <wake_at> --token <token>`.
 2. **Desktop backup task.** Only for reason `wall`. Create it with `fireAt` = `backup_at`, `taskId` `limit-watchdog-<token>`, and the prompt in section E, filling in the ledger's full path, `host_session_id` and the project. Then run `lw timer-add --kind desktop-task --id <task id> --fires <backup_at> --token <token>`.
    - A task created during an automatic turn (a notification or a timer) runs in the default permission mode. It works only because `permissions.allow` covers `lw.exe` and `send_message`.
+   - If this session runs in Bypass mode, the backup's message is held for approval and never wakes it (tested 2026-11-15). The task then falls back to its toast, so the user learns that work did not resume. That notice is the backup's real value.
 3. **Tell the user in one line**: "Armed: wake at <wake_at> for the <for_reset> reset."
 
 ## D. When a `[limit-watchdog <token>]` prompt arrives

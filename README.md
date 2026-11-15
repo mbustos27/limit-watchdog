@@ -105,11 +105,14 @@ All tested on Windows 11 with the desktop app, 2026-11-15:
 | A desktop scheduled task's completion wakes an idle session | **No.** The task runs as its own session; a backup task must message the orchestrator with `send_message` |
 | A scheduled task created during an automatic turn (an agent notification or timer) keeps Bypass permission mode | **No.** It runs in the default mode, so without the `permissions.allow` entries above its first `lw` call waits on a prompt |
 | Dry run: wake → batch of two resumed from transcripts → next batch wake → done; the `irreversible` agent was held for a person | Yes |
+| With the `permissions.allow` entries, a default-mode backup task runs `lw` and `send_message` without a prompt | Yes (the whole run took 36 s) |
+| That backup task's `send_message` wakes an orchestrator running in **Bypass** mode | **No.** A Bypass session holds messages from a sender in another mode for approval, and a desktop session doesn't show that prompt. The task fell back to its toast as designed. So with a Bypass orchestrator the backup is a durable *notifier* ("work did not resume, open the session"), not a waker |
+| First real use: 8 paused streams queued, woken right after a 5-hour reset, resumed in batches of two up to 4 at once, large transcripts restarted fresh from their handoff notes | Yes |
 
 **Not yet proven:**
 - that subagents actually wait out a real 5-hour limit with the env block set
 - the weekly path, live
-- the backup task's `send_message` wake, with the allow rules in place
+- a backup task that can wake a Bypass orchestrator. The candidate is a task saved in Bypass mode, created in a turn the user typed and re-pointed at each arm with `update_scheduled_task`, if updates keep the mode.
 
 ## Layout
 
