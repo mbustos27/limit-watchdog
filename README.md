@@ -1,63 +1,127 @@
 # limit-watchdog
 
-Keeps long, multi-agent Claude Code work going across usage limits on this PC (Claude desktop app, Code tab, Windows 11).
+Keeps Claude Code background agents working across the **5-hour usage limit** and stops cleanly at **weekly limits**. It is a Claude Code skill plus `lw`, a small Rust helper that keeps the ledger and makes every timing decision.
 
-Design source: the deep-research report `C:\Users\moise\Dev\fluentfin-mpv\docs\reports\Auto resume after Claude usage limits.md` ("Arm the wake-up before hitting the wall"). In short:
+It was built for the Claude desktop app's Code tab on Windows, for long runs where the main session launches several background agents and the user walks away, for example overnight.
 
-1. **Prevent**: `CLAUDE_CODE_RETRY_WATCHDOG=1` (+ a 5.5 h max wait) in the user `settings.json` `env` block, so requests and subagents *wait out* a 5-hour reset instead of failing — if the desktop app honours it (Phase 0, check 1).
-2. **Arm early**: at about 80 % of the 5-hour window (read with the desktop app's `get_usage`), stop launching agents, and set a one-shot wake at reset + 4 min (off :00/:30) plus a desktop scheduled-task backup.
-3. **Resume in batches**: from a per-session ledger, two agents at a time with a herd guard (re-check usage after each batch, stop if the window is filling); re-dispatch fresh from a handoff note when an agent's transcript is large; cap unattended concurrency at four.
-4. **Weekly limits**: never wait them out automatically — mark the agents, notify, leave it to the user.
-5. **Never**: read the login token, use other accounts, enable extra-usage credits, or run with permission checks off.
+## The problem
 
-## Phase 0 checks (results)
+When a usage limit lands, background subagents fail. Claude Code's built-in auto-continue (on by default in the CLI, and a checkbox on the desktop app's limit card) resumes only the **main thread**, and only when the main thread itself hit the limit. An idle orchestrator whose subagents all failed gets no turn at the reset, so nothing resumes until someone types.
 
-| # | Check | Result | Date |
-|---|---|---|---|
-| 2 | `CronCreate` loads in a main Code-tab session | **Yes** — loaded and available in session e4cf1356 (session-only jobs; fire only while the session is open and idle; recurring jobs expire after 7 days) | 2026-11-15 |
-| 3 | `get_usage` reset-time format | **ISO 8601 UTC** per window: `{"label": "5-hour limit", "percentUsed": 57, "resetsAt": "2026-11-15T23:30:00.194Z", "resetsIn": "4h 25m"}`; also "Weekly · all models", "Weekly · Fable" and `extraUsage` (enabled false). Plan reported: Pro. Also reports this session's context size (681k tokens = 68 % at the time) | 2026-11-15 |
-| 1 | Desktop Code tab applies `env` from user `settings.json` | **Yes** — after adding `CLAUDE_CODE_RETRY_WATCHDOG=1` and `..._MAX_USAGE_LIMIT_WAIT_MS=19800000` to the user `settings.json` `env` block, a freshly started Code-tab session saw both in Bash and PowerShell (`WATCHDOG=[1] MAXWAIT=[19800000]`). Sessions started before the change don't have them. Whether subagents then *wait* instead of failing is only proven at the next real limit | 2026-11-15 |
-| 4 | A desktop scheduled task (`fireAt` 3 min out) wakes an idle session | **No** — the task fired on time (11:11:08 for 11:11:00), ran as its own new session and succeeded, but its completion notice did **not** start a turn in the idle main session (nothing happened until the user typed). Note: tasks created from a session in Bypass mode are saved in Bypass mode. Not tested: the task actively messaging the session (`send_message`), which unattended runs may be refused | 2026-11-15 |
-| 4b | An in-session `CronCreate` one-shot wakes the idle main session | **Yes** — a one-shot for 11:16 (`16 11 15 11 *`, `recurring: false`) started a turn in the idle session at 11:16:02 with no user input; it then auto-deleted. This is the primary wake path (session must be open, PC awake) | 2026-11-15 |
-| 5 | Main session gets a turn after the limit-failure notice | observed once (2026-11-15 ~03:40): failure notices arrived with a short "grace allowance"; not documented, so not relied on | 2026-11-15 |
+The stopped agents lose nothing: a subagent resumes from its saved transcript when the main session sends it a message (`SendMessage` to its agent id). What is missing is a turn at the right time, plus a record of which agents to resume and how.
 
-**Context-size lesson (2026-11-15):** the orchestrating session had grown to ~681k tokens. A wake after a 5-hour gap re-reads the whole context uncached, so long unattended runs should be orchestrated from a fresh, small session (hand off with a short brief + the ledger), not from a long interactive one.
+## How it works
 
-## Phase 2 dry run (2026-11-15)
+1. **Wait instead of failing.** With `CLAUDE_CODE_RETRY_WATCHDOG=1` and a 5.5-hour maximum wait, a request that hits the 5-hour limit waits for the reset instead of failing. A weekly reset is further away than the cap, so it fails at once, which is what you want.
+2. **Arm before the wall.** On each turn of an unattended run, the session reads the desktop app's usage figures. At about 80 % of the 5-hour window (or when an agent is stopped by the limit), it stops launching agents and arms two timers:
+   - a one-shot `CronCreate` wake at reset + 4 minutes, moved off :00 and :30, which is the primary wake
+   - a desktop scheduled task a few minutes later, as a backup that survives an app restart
+3. **Resume in batches.** When the wake fires, `lw` picks what to resume from a per-session ledger:
+   - Two agents at a time, read-only ones first, then the smallest. Every resume after hours idle re-reads that agent's whole context uncached, so resuming everything at once can burn a fresh window in minutes.
+   - An agent whose transcript is large is re-dispatched fresh from its handoff note instead of resumed.
+   - A herd guard stops the run if usage climbs too fast, a resumed agent fails again right away, or the run passes its wake-cycle limit.
+   - An agent marked `irreversible` (it pushes, deletes, sends, deploys or buys) is never resumed automatically.
+4. **Weekly limits notify only.** Agents are marked, a Windows toast says so, and resuming is left to the user.
 
-Four tiny test agents, two hand-made ledgers in the session scratchpad, timers a few minutes out, `batch_gap_min` 3.
+Every arm, wake, resume and stop shows a Windows toast and is written to the ledger's log.
 
-| Step | Result |
+## What it never does
+
+- Read the login token, call usage endpoints directly, or use another account.
+- Turn on extra usage or credits.
+- Read transcript contents (`lw size` looks at file size only).
+- Resume an agent the user paused or one that finished, or widen an agent's brief.
+- Use a recurring cron as a safety net: each fire would re-read the whole orchestrator context uncached.
+
+Waiting for a reset and continuing your own queued work with Claude Code's own tools is how the product is meant to be used. This tool doesn't try to get around limits.
+
+## Requirements
+
+- **Platform:** Windows 10 or 11, and the Claude desktop app with Claude Code (Code tab). Tested with desktop app 5.11492 and Claude Code 2.1.325.
+- **Tools the session needs:**
+  - `CronCreate`
+  - the desktop app's session-management `get_usage` and `send_message`
+  - desktop scheduled tasks
+- **Rust**, to build `lw`. It's built and tested with the GNU toolchain (`stable-x86_64-pc-windows-gnu` plus WinLibs); MSVC is untested. See [`lw/README.md`](lw/README.md).
+- **Keep the app open and the PC awake.** In-session timers die with the app, and sleep cancels every timer. Set the power plan to never sleep on AC for unattended runs.
+
+## Install
+
+1. Build `lw`:
+   ```powershell
+   cd lw
+   .\gate.ps1              # format check, clippy, all tests
+   cargo build --release   # lw\target\release\lw.exe
+   ```
+2. Install the skill:
+   ```powershell
+   $dst = "$env:USERPROFILE\.claude\skills\limit-watchdog"
+   New-Item -ItemType Directory -Force "$dst\bin" | Out-Null
+   Copy-Item skill\SKILL.md "$dst\SKILL.md"
+   Copy-Item lw\target\release\lw.exe "$dst\bin\lw.exe"
+   & "$dst\bin\lw.exe" toast-setup   # once per PC: registers the toast app id under HKCU
+   ```
+3. Add the following to `%USERPROFILE%\.claude\settings.json`, merging with what is there:
+   ```json
+   {
+     "env": {
+       "CLAUDE_CODE_RETRY_WATCHDOG": "1",
+       "CLAUDE_CODE_RETRY_WATCHDOG_MAX_USAGE_LIMIT_WAIT_MS": "19800000"
+     },
+     "permissions": {
+       "allow": [
+         "Bash(~/.claude/skills/limit-watchdog/bin/lw.exe:*)",
+         "mcp__ccd_session_mgmt__send_message"
+       ]
+     }
+   }
+   ```
+   - The `env` block applies only to sessions started after you add it.
+   - The `permissions` entries matter for the backup task (see "Tested behaviour" below).
+4. Optional: tick "Auto-continue when limits reset" on the desktop app's 5-hour limit card when it shows. It helps the main thread only.
+
+## Use
+
+Ask Claude to run work unattended with the watchdog, for example "run these four streams overnight; use the limit watchdog". The skill then:
+- creates a ledger (`%USERPROFILE%\.claude\work-ledger\<session-id>.json`)
+- registers each background agent with a kind and a risk class
+- adds a handoff rule to every brief: keep `HANDOFF.md` current, so a fresh agent can take over
+- checks usage on every agent notification, and arms, wakes and resumes as described above
+
+The full procedure is in [`skill/SKILL.md`](skill/SKILL.md); every `lw` command and decision is in [`lw/README.md`](lw/README.md).
+
+**Tip:** each wake re-reads the orchestrating session's whole context. For a long unattended run, start from a fresh, small session that launches the agents itself. Agents can only be resumed by the session that launched them.
+
+## Tested behaviour
+
+All tested on Windows 11 with the desktop app, 2026-11-15:
+
+| Behaviour | Result |
 |---|---|
-| `tick` at 85 % with a reset 1 min ago | `arm` w1: wake 13:34 (`34 13 15 11 *`), backup 13:40 |
-| `CronCreate` one-shot w1 | Fired 13:34:02 in the idle session. `next` → `resume` dry-a (read-only, first) + dry-b; dry-c (`irreversible`) → `needs-human`; 1 remaining; batch wake w2 at 13:38 |
-| `SendMessage` resumes | Both agents resumed from their transcripts and answered "step 2 done" within 2 s |
-| `tick` while w2 pending | `armed` (no duplicate wake) |
-| Batch wake w2 | Fired 13:38:02. `next` → `resume` dry-d; 0 remaining; `arm` null. After it finished: `tick` → `ok`; `wake-status w1` → handled, not current |
-| Toasts | Delivered (after `lw toast-setup`) |
-| **Desktop backup tasks** (dry 1: should find w1 handled; dry 2: no cron, should `send_message` this session) | **Failed.** Both started on time (13:40:10). But a task created in a turn started by an automatic event (agent notification, timer) is **not** saved in Bypass mode. It runs in the default mode, so its first Bash call (`lw wake-status`) waited on a permission prompt for 49 min until it was interrupted at 14:29. The `send_message` wake path is therefore still untested |
+| The desktop Code tab applies `env` from the user `settings.json` | Yes, in sessions started after the change |
+| `CronCreate` is available in a main Code-tab session | Yes. Jobs are session-only, fire only while the session is idle, and recurring jobs expire after 7 days |
+| `get_usage` reset times | ISO 8601 UTC per window (5-hour, weekly, per-model weekly) |
+| A one-shot `CronCreate` wakes an idle session | Yes, three times, each within 2 s of the set minute |
+| A desktop scheduled task's completion wakes an idle session | **No.** The task runs as its own session; a backup task must message the orchestrator with `send_message` |
+| A scheduled task created during an automatic turn (an agent notification or timer) keeps Bypass permission mode | **No.** It runs in the default mode, so without the `permissions.allow` entries above its first `lw` call waits on a prompt |
+| Dry run: wake → batch of two resumed from transcripts → next batch wake → done; the `irreversible` agent was held for a person | Yes |
 
-**Fix needed for the backup path:** one of these.
-- (a) A narrow `permissions.allow` in the user `settings.json`: `lw.exe` in Bash, plus `mcp__ccd_session_mgmt__send_message`.
-- (b) A single reusable backup task created in a turn the user typed, so it keeps Bypass mode, and re-pointed with `update_scheduled_task` at each arm. Not yet known whether an update keeps the mode.
-
-Until then, the in-session `CronCreate` one-shot is the only wake, so the session must stay open.
-
-**Sizes:** the test agents' transcripts are ~437 KB. The real FluentFin MPV streams are 2.7–12.7 MB, so 5 of 8 are past the 3 MB line and get re-dispatched fresh from their `PAUSED.md`.
-
-## Phase 1 configuration (status)
-
-| Item | State |
-|---|---|
-| Retry-watchdog `env` block in `C:\Users\moise\.claude\settings.json` | Done 2026-11-15 (check 1). Whether a subagent really *waits* is proven only at the next real 5-hour limit |
-| Power plan never sleeps on AC | Already so: High performance, sleep and hibernate "never" on AC (read 2026-11-15) |
-| "Auto-continue when limits reset" checkbox | The user's action, on the 5-hour limit card when one shows. Main thread only; never relied on |
-| `permissions.allow` coverage | The orchestrating session runs in Bypass mode and its background agents inherit it, so no prompts stall a night. A session in another mode needs the allowlist audited first |
-| Unattended cap of 4 | `lw` default `run.max_concurrent = 4` |
-| HANDOFF rule in agent briefs | Skill section A, step 2 (pasted into every brief) |
+**Not yet proven:**
+- that subagents actually wait out a real 5-hour limit with the env block set
+- the weekly path, live
+- the backup task's `send_message` wake, with the allow rules in place
 
 ## Layout
-- `skill\SKILL.md` — the procedure (v2). Installed copy: `C:\Users\moise\.claude\skills\limit-watchdog\SKILL.md`, with `bin\lw.exe` beside it.
-- `lw\` — the Rust helper: per-session ledger (atomic writes under a lock), reset-time parser, arm/next decisions with batches and the herd guard, transcript size check (file size only), toasts.
-- `ledger.example.json` — ledger format (v2), matching `lw`.
-- Ledgers live in `C:\Users\moise\.claude\work-ledger\<session-id>.json`, one per orchestrating session.
+
+- `skill/SKILL.md`: the procedure Claude follows.
+- `lw/`: the Rust helper.
+  - per-session ledger with atomic writes under a lock
+  - reset-time parser
+  - arm and wake decisions, batches and herd guard
+  - transcript size check
+  - toasts
+- `ledger.example.json`: the ledger format, generated by `lw`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

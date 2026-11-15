@@ -10,10 +10,10 @@ Nothing runs while a usage limit is active: not the main session, not subagents.
 1. **Waiting instead of failing.** The user `settings.json` sets `CLAUDE_CODE_RETRY_WATCHDOG=1` with a 5.5 h maximum wait, so a request that hits the 5-hour limit waits for the reset. A weekly reset is further away than 5.5 h, so it fails at once (that is wanted).
 2. **A timer armed before the wall.** Desktop auto-continue resumes only the main thread, and only when the main thread itself hit the limit. An idle orchestrator whose subagents all failed gets no turn at the reset. So at about 80 % of the 5-hour window the main session arms a one-shot `CronCreate` wake for reset + 4 min, plus a Desktop scheduled task as a backup. When it fires, agents are resumed from a ledger **in batches of two**. Every resume after hours idle re-reads that agent's whole context uncached.
 
-Design and test results: `C:\Users\moise\Dev\limit-watchdog\README.md`.
+Design and test results: the README of github.com/mbustos27/limit-watchdog.
 
 ## Tools
-- **`lw`** (`C:\Users\moise\.claude\skills\limit-watchdog\bin\lw.exe`; in Bash `/c/Users/moise/.claude/skills/limit-watchdog/bin/lw.exe`). It owns the ledger and every timing decision; never edit the ledger by hand. It finds this session's ledger from `CLAUDE_CODE_SESSION_ID`: `C:\Users\moise\.claude\work-ledger\<session-id>.json`. From any other session, pass `--ledger <full path>`. It prints JSON. `lw show` gives a summary.
+- **`lw`** (`%USERPROFILE%\.claude\skills\limit-watchdog\bin\lw.exe`). In Bash, always call it exactly as `~/.claude/skills/limit-watchdog/bin/lw.exe`, unquoted: that string is what the `permissions.allow` rule matches. It owns the ledger and every timing decision; never edit the ledger by hand. It finds this session's ledger from `CLAUDE_CODE_SESSION_ID`: `%USERPROFILE%\.claude\work-ledger\<session-id>.json`. From any other session, pass `--ledger <full path>`. It prints JSON. `lw show` gives a summary.
 - **Usage**: `mcp__ccd_session_mgmt__get_usage`. Pass these values to `lw`:
   - `--five-pct` / `--five-resets-at`: `percentUsed` / `resetsAt` of "5-hour limit".
   - `--weekly-pct` / `--weekly-resets-at`: the higher of "Weekly · all models" and the weekly row for the model the agents use.
@@ -95,7 +95,7 @@ Each agent notification gives this session a turn. In that turn:
 
 ## E. Desktop backup task prompt
 ```
-[limit-watchdog backup <token>] Run: "C:\Users\moise\.claude\skills\limit-watchdog\bin\lw.exe" --ledger "<ledger path>" wake-status --token <token>
+[limit-watchdog backup <token>] Run in Bash, exactly: ~/.claude/skills/limit-watchdog/bin/lw.exe --ledger "<ledger path>" wake-status --token <token>
 If "handled" is true, or "current" is false: reply "already handled" and stop.
 Otherwise load mcp__ccd_session_mgmt__send_message with ToolSearch and send session <host_session_id> exactly:
 [limit-watchdog <token>] Follow the limit-watchdog skill, section D, for wake token <token>.
