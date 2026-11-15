@@ -23,6 +23,28 @@ Design source: the deep-research report `C:\Users\moise\Dev\fluentfin-mpv\docs\r
 
 **Context-size lesson (2026-11-15):** the orchestrating session had grown to ~681k tokens. A wake after a 5-hour gap re-reads the whole context uncached, so long unattended runs should be orchestrated from a fresh, small session (hand off with a short brief + the ledger), not from a long interactive one.
 
+## Phase 2 dry run (2026-11-15)
+
+Four tiny test agents, two hand-made ledgers in the session scratchpad, timers a few minutes out, `batch_gap_min` 3.
+
+| Step | Result |
+|---|---|
+| `tick` at 85 % with a reset 1 min ago | `arm` w1: wake 13:34 (`34 13 15 11 *`), backup 13:40 |
+| `CronCreate` one-shot w1 | Fired 13:34:02 in the idle session. `next` → `resume` dry-a (read-only, first) + dry-b; dry-c (`irreversible`) → `needs-human`; 1 remaining; batch wake w2 at 13:38 |
+| `SendMessage` resumes | Both agents resumed from their transcripts and answered "step 2 done" within 2 s |
+| `tick` while w2 pending | `armed` (no duplicate wake) |
+| Batch wake w2 | Fired 13:38:02. `next` → `resume` dry-d; 0 remaining; `arm` null. After it finished: `tick` → `ok`; `wake-status w1` → handled, not current |
+| Toasts | Delivered (after `lw toast-setup`) |
+| **Desktop backup tasks** (dry 1: should find w1 handled; dry 2: no cron, should `send_message` this session) | **Failed.** Both started on time (13:40:10). But a task created in a turn started by an automatic event (agent notification, timer) is **not** saved in Bypass mode. It runs in the default mode, so its first Bash call (`lw wake-status`) waited on a permission prompt for 49 min until it was interrupted at 14:29. The `send_message` wake path is therefore still untested |
+
+**Fix needed for the backup path:** one of these.
+- (a) A narrow `permissions.allow` in the user `settings.json`: `lw.exe` in Bash, plus `mcp__ccd_session_mgmt__send_message`.
+- (b) A single reusable backup task created in a turn the user typed, so it keeps Bypass mode, and re-pointed with `update_scheduled_task` at each arm. Not yet known whether an update keeps the mode.
+
+Until then, the in-session `CronCreate` one-shot is the only wake, so the session must stay open.
+
+**Sizes:** the test agents' transcripts are ~437 KB. The real FluentFin MPV streams are 2.7–12.7 MB, so 5 of 8 are past the 3 MB line and get re-dispatched fresh from their `PAUSED.md`.
+
 ## Phase 1 configuration (status)
 
 | Item | State |
