@@ -32,7 +32,7 @@ Check these once per run, and tell the user which ones are theirs to do:
 - **Keep the orchestrator small.** A wake re-reads this session's whole context uncached. If `get_usage` reports a large context (over ~200k tokens), run the night from a fresh session that launches the agents itself, with a short brief plus the stream list. Agents can only be resumed by the session that launched them.
 
 Then:
-1. `lw init --project "<name and path>" --unattended`.
+1. Run `lw init --project "<name and path>" --unattended`. If this session already has a ledger, run `lw run-set unattended true` and `lw new-night` instead, which zero the per-night counters. If `warnings` says the host session id is empty, the backup task has no session to message. Tell the user that only the in-session timer will wake this run.
 2. Add the **HANDOFF rule** to every brief, word for word:
    > Keep `HANDOFF.md` at your worktree root up to date at each work boundary (after each commit, test run or finished step): steps done, the current step, and any in-flight operation (command, file being edited, external request) with how to check whether it completed. If you are resumed, read it first, skip steps marked done, and re-check any in-flight operation before retrying it.
 3. Write each agent's brief to a file (`<worktree>\BRIEF.md`) so it can be re-dispatched fresh.
@@ -42,56 +42,64 @@ Then:
 
 ## B. Every turn while agents run
 Each agent notification gives this session a turn. In that turn:
-1. Call `get_usage`, then run `lw tick --five-pct … --five-resets-at … --weekly-pct … --weekly-resets-at …`.
-2. Act on the result:
-   - `"action":"arm"`: arm the timers (C).
-   - `"armed"` or `"ok"`: nothing to arm.
-   - `"weekly-warn"`: launch nothing more and tell the user.
-   - `"stop_launching": true`: launch no new agents this window. The running ones carry on.
-3. Act on the notification:
+1. **Record the notification first**:
    - **Agent finished**: `lw set <id> done`.
-   - **Agent stopped by a usage limit**: `lw stopped <id> --text "<the notification's limit line>"`, then `lw tick` again (it arms if nothing is armed yet).
-   - **Agent failed for another reason**: `lw set <id> needs-human --note "<one line>"`. Never auto-retry it.
-   - **User pauses something**: ask the agent to stop at a safe point and update HANDOFF.md, then `lw set <id> paused-by-user`.
+   - **Agent stopped by a usage limit**: `lw stopped <id> --text "<the notification's limit line>"`.
+     - If the output has `ignored: true`, the agent had already finished or was paused, and nothing changed.
+     - If it has a `toast` (the herd guard tripped), show it with `lw toast`.
+   - **Agent failed for another reason**: `lw set <id> needs-human --note "<one line>"`. Never retry it automatically.
+   - **User pauses something**: ask the agent to stop at a safe point and update its handoff, then `lw set <id> paused-by-user`.
+2. **Then** call `get_usage` and run `lw tick --five-pct … --five-resets-at … --weekly-pct … --weekly-resets-at …`.
+3. **Act on the result.**
+   - `arm`: arm the timers (C). This includes an `arm` with `reissued: true`, which means no timer was recorded for it yet. An `arm` with reason `batch` is a short wake for agents waiting while the window is open: cron only.
+   - `armed` or `ok`: nothing to arm.
+   - `herd-stopped`: the herd guard is tripped. Launch and resume nothing, tell the user, and leave it to them (`lw run-set herd_tripped false` or `lw new-night` clears it).
+   - `weekly-warn`: launch nothing more and tell the user.
+   - `stop_launching: true`: launch no new agents this window. The running ones carry on.
 
 ## C. Arming the timers
-`lw` returns `token`, `cron`, `wake_at`, `backup_at` and `for_reset`. Do all three steps:
-1. **`CronCreate` one-shot.** Use `cron` as returned (local time, already moved off :00/:30), `recurring: false`, and this prompt:
+**Rule for every `lw` output:** delete each id in `delete_timers` (`CronDelete` for a cron job id, `…__delete_scheduled_task` for a `limit-watchdog-…` task id). A missing one is fine. Superseded one-shots would otherwise still fire, and each fire re-reads this whole session.
+
+An `arm` returns `token`, `reason`, `cron`, `wake_at`, `backup_at` and `for_reset`. Then:
+1. **`CronCreate` one-shot.** Use `cron` exactly as returned (local time, already moved off :00/:30 and out of a DST repeated hour), `recurring: false`, and this prompt:
    ```
    [limit-watchdog <token>] Follow the limit-watchdog skill, section D, for wake token <token>.
    ```
    Then run `lw timer-add --kind cron-oneshot --id <job id> --fires <wake_at> --token <token>`.
-2. **Desktop backup task** (only for a `wall` wake, not a `batch` wake). Create it with `fireAt` = `backup_at`, name `limit-watchdog-<token>`, and the prompt in section E. Fill in the ledger's full path and `host_session_id`. Then run `lw timer-add --kind desktop-task --id <task id> --fires <backup_at> --token <token>`.
-   - A task created from a Bypass-mode session is saved in Bypass mode. That is needed, because a Bypass session holds incoming messages from a non-bypass sender for approval it cannot show.
+2. **Desktop backup task.** Only for reason `wall`. Create it with `fireAt` = `backup_at`, `taskId` `limit-watchdog-<token>`, and the prompt in section E, filling in the ledger's full path, `host_session_id` and the project. Then run `lw timer-add --kind desktop-task --id <task id> --fires <backup_at> --token <token>`.
+   - A task created during an automatic turn (a notification or a timer) runs in the default permission mode. It works only because `permissions.allow` covers `lw.exe` and `send_message`.
 3. **Tell the user in one line**: "Armed: wake at <wake_at> for the <for_reset> reset."
 
 ## D. When a `[limit-watchdog <token>]` prompt arrives
-1. Call `get_usage` first. A resume sent before the reset dies on the limit again.
-2. Run `lw next --token <token> --five-pct … --five-resets-at … --weekly-pct … --weekly-resets-at …`.
-3. Do exactly what the action says:
+0. **Record late notices.** Any agent notification since the last `lw` call that isn't in the ledger yet goes in first, as in B1. A limit notice handled after the resume would put the agent back to stopped and trip the herd guard.
+1. **Call `get_usage`.** A resume sent before the reset dies on the limit again.
+2. **Run** `lw next --token <token> --five-pct … --five-resets-at … --weekly-pct … --weekly-resets-at …`. Delete any `delete_timers` (C).
+3. **Do exactly what the action says.**
    - **`already-handled`**: the other timer got here first. Reply in one line and stop.
    - **`still-limited`**: arm again with the returned fields (C) and stop.
    - **`weekly-stop`**:
-     - Run `lw toast "Limit watchdog" "<toast>"`.
-     - Create one Desktop task at `notify_at` whose prompt is only: `Run "<lw path>" --ledger "<ledger path>" toast "Weekly limit reset" "Agents are waiting in <project>; resume them by hand."` Record it with `lw timer-add`.
-     - Stop. Never resume after a weekly limit without the user's word.
-   - **`herd-stop`**:
-     - Run `lw toast`.
-     - `CronDelete` the cron timers, delete the Desktop tasks, then `lw timers-clear`.
-     - Stop and leave the rest for the user.
-   - **`resume`**: for each `batch` item, in order:
+     1. Run `lw toast "Limit watchdog" "<toast>"`.
+     2. Arm the returned weekly wake with `CronCreate` (C1, cron only). Also create one Desktop task at `notify_at` whose prompt is only: `Run in Bash, exactly: ~/.claude/skills/limit-watchdog/bin/lw.exe --ledger "<ledger path>" toast "Weekly limit reset" "Agents are waiting in <project>; resume them by hand."` Record both with `lw timer-add`.
+     3. Stop. Never resume after a weekly limit without the user's word.
+   - **`weekly-reset`** (the weekly wake fired): toast it and stop. Resuming is the user's call.
+   - **`herd-stop`**: run `lw toast`, then `lw timers-clear` and delete what it lists. Stop and leave the rest to the user.
+   - **`resume`**: work through each `batch` item in order.
      - **`mode: resume`**: `SendMessage` to the item `id` with its `resume` text.
-     - **`mode: redispatch`**: launch a fresh background agent of `agent_type` with the brief from `brief_file`, plus "Read <handoff> first; skip steps marked done; re-check any in-flight operation before retrying it." Then run `lw set <old id> done --note "redispatched as <new id>"` and `lw add` the new agent with the same fields.
-     - **If a send or launch fails on the limit**: `lw stopped <id> --text "<error>"`, then stop the batch.
+     - **`mode: redispatch`**:
+       1. Launch a fresh background agent of `agent_type` with the brief from `brief_file`, plus "Read <handoff> first; skip steps marked done; re-check any in-flight operation before retrying it."
+       2. Run `lw add --id <new id> --replaces <old id>`. It copies the other fields and the per-agent counters, and marks the old agent done.
+     - **If a send or launch fails**:
+       1. Run `lw unsent <that id> <every later batch id>`, then stop the batch.
+       2. Call `get_usage` and run `lw tick`, then arm per C.
+       3. If the error was not a usage limit, also run `lw set <id> needs-human --note "<error>"` for that one agent and toast it.
 
      After the batch:
      - If `arm` is set, arm the next batch: `CronCreate` only, as in C1.
+     - `waiting_for_room: n` means n agents wait for a free slot. Nothing to arm now: the `tick` after the next completion (B) arms a short wake for them.
      - If `needs_human` is not empty, toast the names.
      - Toast the `toast` text.
-   - **`done`**:
-     - `CronDelete` / delete each id in `delete_timers`. A missing one is fine.
-     - Toast and reply in one line.
-4. Never start new work, merge, rebuild or widen a brief from a wake. Agents carry on with their own briefs. Their results are handled in later turns as usual (B).
+   - **`done`**: toast and reply in one line.
+4. Never start new work, merge, rebuild or widen a brief from a wake. Agents carry on with their own briefs, and their results are handled in later turns as usual (B).
 
 ## E. Desktop backup task prompt
 ```
