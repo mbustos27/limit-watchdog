@@ -98,7 +98,7 @@ An `arm` returns `token`, `reason`, `cron`, `wake_at`, `backup_at` and `for_rese
      - If `arm` is set, arm the next batch: `CronCreate` only, as in C1.
      - `waiting_for_room: n` means n agents wait for a free slot. Nothing to arm now: the `tick` after the next completion (B) arms a short wake for them.
      - If `needs_human` is not empty, toast the names.
-     - Toast the `toast` text.
+     - Toast the `toast` text (null when the batch is empty).
    - **`done`**: toast and reply in one line.
 4. Never start new work, merge, rebuild or widen a brief from a wake. Agents carry on with their own briefs, and their results are handled in later turns as usual (B).
 
