@@ -89,10 +89,15 @@ pub struct Run {
     pub arm_at_pct: u32,
     pub herd_rise_pct: u32,
     pub herd_refail_min: u32,
+    /// The rise check (5-hour % minus `cycle_base_pct` over `herd_rise_pct`) applies only this many minutes after the wall
+    /// wake was handled: it is for a resume burst, not for ordinary work later in the cycle.
+    pub herd_window_min: u32,
     pub weekly_stop_pct: u32,
     pub redispatch_over_bytes: u64,
     pub resume_after_weekly: bool,
     pub cycle_base_pct: Option<u32>,
+    /// When the current cycle's wall wake was handled; the herd window starts here. Kept by lw itself.
+    pub cycle_started_at: Option<String>,
     pub herd_tripped: bool,
     /// How many wakes this ledger has created; the next token is `w<wake_seq + 1>`, so a token is never reused.
     pub wake_seq: u32,
@@ -111,10 +116,12 @@ impl Default for Run {
             arm_at_pct: 80,
             herd_rise_pct: 20,
             herd_refail_min: 30,
+            herd_window_min: 30,
             weekly_stop_pct: 90,
             redispatch_over_bytes: 3_000_000,
             resume_after_weekly: false,
             cycle_base_pct: None,
+            cycle_started_at: None,
             herd_tripped: false,
             wake_seq: 0,
         }

@@ -27,6 +27,8 @@ Dependencies: serde, serde_json, chrono, chrono-tz, and the `windows` crate for 
 - Schema version 2: see `..\ledger.example.json`. Additions to the spec:
   - `run.wake_seq` counts the wakes created so far. Tokens are `w<wake_seq>`, so a token is never reused, even after `done` clears the wake.
   - Each agent's `prev_resumed` keeps the `last_resumed` from before the latest resume, so `unsent` can put it back.
+  - `run.herd_window_min` (default 30): how long after a wall wake the herd guard's rise check applies. See `next`, step 5.
+  - `run.cycle_started_at`: when the current cycle's wall wake was handled, so where the herd window starts. lw keeps it; a ledger without it reads as null.
 - The log keeps the newest 500 lines.
 - States: `running`, `stopped-by-limit`, `stopped-by-weekly`, `needs-human`, `paused-by-user` and `done`. Explore and Plan agents are always `redispatch`.
 
@@ -57,8 +59,8 @@ Errors go to stderr, prefixed `lw: `. The global `--now ISO` replaces the clock,
 | `wake-status --token T` | Read-only: `{handled, current, host_session_id, session_id, pending_agents, reason, wake_at, current_token}`. `handled` is true when T is not the current wake, or when it is current and already stamped. |
 | `timers-clear` | `{delete_timers:[ids]}`, then empties the list. |
 | `size ID` | `{id, path, bytes, mode, why, in_ledger}` from `...\projects\*\<session_id>\subagents\agent-<ID>.jsonl` metadata. A missing file gives bytes null and mode `redispatch`. |
-| `run-set KEY VALUE` | One `run` field, validated: percentages 1–100, counts ≥ 1, bools true/false. `cycle_base_pct` takes `null`. `-` and `_` both work in key names. |
-| `new-night` | Zeroes `wake_cycles`, `cycle_base_pct`, `herd_tripped` and every agent's `resumes_tonight`. |
+| `run-set KEY VALUE` | One `run` field, validated: percentages 1–100, counts ≥ 1, `herd_window_min` 1–1440 minutes, bools true/false. `cycle_base_pct` takes `null`. `wake_seq` and `cycle_started_at` are refused (lw keeps them). `-` and `_` both work in key names. |
+| `new-night` | Zeroes `wake_cycles`, `cycle_base_pct`, `cycle_started_at`, `herd_tripped` and every agent's `resumes_tonight`. |
 | `show [--json]` | Summary, or the whole ledger. |
 | `log TEXT` | Append a log line. |
 | `toast TITLE BODY` | Show a Windows toast and log it. Always exits 0: if the toast fails, or there is no ledger, `warnings` says so (also on stderr). |
@@ -104,7 +106,7 @@ Errors go to stderr, prefixed `lw: `. The global `--now ISO` replaces the clock,
 
 **`next`**, when a timer fires, in this order:
 1. **`already-handled`**: the token is not the current wake, or the wake is already stamped. Nothing changes.
-2. lw stamps `handled_at`. A wall wake also adds 1 to `wake_cycles` and sets `cycle_base_pct` to the current 5-hour %.
+2. lw stamps `handled_at`. A wall wake also adds 1 to `wake_cycles`, sets `cycle_base_pct` to the current 5-hour % and sets `cycle_started_at` to now.
    - A weekly wake (the notice after a weekly stop) returns **`weekly-reset`** `{waiting, toast}` and resumes nothing.
    - With `resume_after_weekly`, a weekly wake instead moves stopped-by-weekly agents back to stopped-by-limit and carries on with step 3.
 3. **`still-limited`**: 5-hour ≥ 100. lw re-arms a wall wake for the new reset, unless `wake_cycles` ≥ `max_wake_cycles`, which is a herd stop.
@@ -113,16 +115,18 @@ Errors go to stderr, prefixed `lw: `. The global `--now ISO` replaces the clock,
    - lw creates a weekly wake at weekly reset + 15 min → `{weekly_pct, weekly_resets_at, notify_at, cron, token, agents, toast}`.
 5. **`herd-stop`** `{reason, waiting, toast}` when any of these holds:
    - `herd_tripped` is set
-   - 5-hour − `cycle_base_pct` > `herd_rise_pct`
+   - 5-hour − `cycle_base_pct` > `herd_rise_pct`, less than `herd_window_min` minutes after `cycle_started_at`
    - `wake_cycles` > `max_wake_cycles`
 
    A herd stop also sets `herd_tripped`, so later ticks don't arm again.
+
+   The rise check is there to catch a burst of usage from the resume right after a wall wake. In a long cycle, batch wakes come 30 minutes or more after the wall wake, and by then ordinary agent work has raised usage. Comparing against the old base would trip the guard on normal work, and a tripped guard stops `tick` from arming the next wall wake. So past the window a batch wake does not compare: it sets `cycle_base_pct` to the current 5-hour % (logged). A ledger without `cycle_started_at` counts as past the window.
 6. Each stopped-by-limit agent that is `irreversible`, or has `resumes_tonight` ≥ `max_resumes_per_agent`, becomes `needs-human` (listed in `needs_human` with a `why`).
 7. **`resume`**: lw takes the remaining stopped-by-limit agents, read-only first, then the smallest transcript (none counts as 0), then ledger order. The batch size is min(`batch_size`, `max_concurrent` − running).
    - Each agent gets a `mode`: `redispatch` if its kind is redispatch, its transcript is over `redispatch_over_bytes`, or no transcript was found; else `resume`.
    - Each agent is set to `running`, gets `resumes_tonight` + 1 and `last_resumed` = now (the old value goes to `prev_resumed`), and is logged.
    - If more remain and there was room, lw creates a batch wake at now + `batch_gap_min` → `arm: {token, cron, wake_at, backup_at}`.
-   - With no room at all, the batch is empty, `arm` is null and `waiting_for_room` is the number waiting. lw does not poll: the `tick` after the next agent completion arms a batch wake.
+   - With no room at all, the batch is empty, `arm` is null and `waiting_for_room` is the number waiting. `toast` is null too, since nothing was resumed and a toast would only be noise (`needs_human` is still listed). lw does not poll: the `tick` after the next agent completion arms a batch wake.
    - Otherwise `arm` is null and `waiting_for_room` is 0.
    - Output: `{batch:[{id, name, mode, why, resume, agent_type, brief_file, handoff, worktree, transcript_bytes}], needs_human, remaining, waiting_for_room, arm, delete_timers, toast}`.
 8. **`done`**: nothing is stopped-by-limit → `{delete_timers, needs_human, toast}`. lw clears `timers` and `wake`.
@@ -135,7 +139,7 @@ Errors go to stderr, prefixed `lw: `. The global `--now ISO` replaces the clock,
 
 **`delete_timers`**: any output that has it (`arm`, `still-limited`, `weekly-stop`, `herd-stop`, `resume`, `done`, `weekly-reset`, `timers-clear`) lists timers that belong to an older or finished wake. Delete each one (a missing one is fine). lw has already dropped them from the ledger.
 
-**`toast`** in an output is the body text. The caller picks the title, for example `lw toast "Limit watchdog" "<toast>"`.
+**`toast`** in an output is the body text; null means there is nothing to show. The caller picks the title, for example `lw toast "Limit watchdog" "<toast>"`.
 
 ## Example flow
 

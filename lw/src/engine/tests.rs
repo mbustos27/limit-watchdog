@@ -360,6 +360,45 @@ fn herd_stop_when_usage_rises_too_fast_since_the_wake() {
 }
 
 #[test]
+fn the_rise_check_covers_only_the_herd_window_after_the_wall_wake() {
+    let agents = (1..=6).map(|i| agent(&format!("a{i}"), Risk::LocalWrites, State::StoppedByLimit)).collect();
+    let mut l = ledger(agents);
+    l.run.max_concurrent = 8;
+    let w1 = armed(&mut l);
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(10, R2), &small).unwrap();
+    assert_eq!((l.run.cycle_base_pct, l.run.cycle_started_at.as_deref()), (Some(10), Some("2026-11-15T15:34:00-08:00")));
+    let w2 = out["arm"]["token"].as_str().unwrap().to_string();
+    // just inside the 30-minute window, 31 % is still a burst
+    let mut inside = l.clone();
+    let (out, _) = next(&mut inside, &ctx("2026-11-15T16:03:59-08:00"), &w2, &usage(31, R2), &small).unwrap();
+    assert_eq!(out["action"], "herd-stop", "{out}");
+    // a longer window set by the person still covers 16:04
+    let mut longer = l.clone();
+    run_set(&mut longer, &ctx("2026-11-15T15:35:00-08:00"), "herd-window-min", "60").unwrap();
+    let (out, _) = next(&mut longer, &ctx("2026-11-15T16:04:00-08:00"), &w2, &usage(45, R2), &small).unwrap();
+    assert_eq!(out["action"], "herd-stop", "{out}");
+    // 30 minutes after the wall wake, ordinary work has raised usage: no herd stop; the base moves to the current figure
+    let (out, _) = next(&mut l, &ctx("2026-11-15T16:04:00-08:00"), &w2, &usage(45, R2), &small).unwrap();
+    assert_eq!(out["action"], "resume", "{out}");
+    assert_eq!((l.run.cycle_base_pct, l.run.herd_tripped), (Some(45), false));
+    assert_eq!(l.run.cycle_started_at.as_deref(), Some("2026-11-15T15:34:00-08:00"));
+    assert!(l.log.iter().any(|e| e.msg == "past the 30 min herd window: cycle base 10% -> 45%"));
+    let w3 = out["arm"]["token"].as_str().unwrap().to_string();
+    let (out, _) = next(&mut l, &ctx("2026-11-15T16:16:00-08:00"), &w3, &usage(70, R2), &small).unwrap();
+    assert_eq!((out["action"].as_str(), l.run.cycle_base_pct), (Some("resume"), Some(70)));
+    // so the run still meets the next limit: tick arms the wall wake instead of answering herd-stopped
+    let (out, _) = tick(&mut l, &ctx("2026-11-15T16:30:00-08:00"), &usage(85, R2)).unwrap();
+    assert_eq!((out["action"].as_str(), out["reason"].as_str()), (Some("arm"), Some("wall")));
+    // a ledger written before cycle_started_at existed counts as past the window
+    let mut old = ledger((1..=3).map(|i| agent(&format!("a{i}"), Risk::LocalWrites, State::StoppedByLimit)).collect());
+    let w1 = armed(&mut old);
+    let (out, _) = next(&mut old, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(10, R2), &small).unwrap();
+    old.run.cycle_started_at = None;
+    let (out, _) = next(&mut old, &ctx("2026-11-15T15:46:00-08:00"), out["arm"]["token"].as_str().unwrap(), &usage(45, R2), &small).unwrap();
+    assert_eq!((out["action"].as_str(), old.run.cycle_base_pct), (Some("resume"), Some(45)));
+}
+
+#[test]
 fn herd_stop_past_the_wake_cycle_cap() {
     let mut l = ledger(vec![agent("a1", Risk::LocalWrites, State::StoppedByLimit)]);
     l.run.wake_cycles = 3;
@@ -469,6 +508,27 @@ fn a_full_house_resumes_nobody_and_waits_for_a_completion_instead_of_polling() {
     set(&mut l, &ctx("2026-11-15T15:50:00-08:00"), "r1", State::Done, None).unwrap();
     let (out, _) = tick(&mut l, &ctx("2026-11-15T15:50:00-08:00"), &usage(5, R2)).unwrap();
     assert_eq!((out["action"].as_str(), out["reason"].as_str(), out["wake_at"].as_str()), (Some("arm"), Some("batch"), Some("2026-11-15T15:52:00-08:00")));
+}
+
+#[test]
+fn an_empty_batch_has_no_toast() {
+    let mut l = ledger(vec![
+        agent("a1", Risk::LocalWrites, State::StoppedByLimit),
+        agent("x1", Risk::Irreversible, State::StoppedByLimit),
+        agent("r1", Risk::LocalWrites, State::Running),
+    ]);
+    l.run.max_concurrent = 1;
+    let w1 = armed(&mut l);
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:34:00-08:00"), &w1, &usage(2, R2), &small).unwrap();
+    assert_eq!((out["action"].as_str(), out["batch"].clone()), (Some("resume"), json!([])));
+    assert_eq!(out["waiting_for_room"], 1);
+    assert_eq!(out["needs_human"][0]["id"], "x1");
+    assert_eq!(out["toast"], Value::Null, "{out}");
+    // a batch that resumed someone still has one
+    set(&mut l, &ctx("2026-11-15T15:40:00-08:00"), "r1", State::Done, None).unwrap();
+    let w = tick(&mut l, &ctx("2026-11-15T15:40:00-08:00"), &usage(5, R2)).unwrap().0["token"].as_str().unwrap().to_string();
+    let (out, _) = next(&mut l, &ctx("2026-11-15T15:42:00-08:00"), &w, &usage(5, R2), &small).unwrap();
+    assert_eq!(out["toast"], "Resumed 1: a1-stream.");
 }
 
 #[test]
@@ -758,7 +818,13 @@ fn run_set_validates_keys_and_values() {
     assert_eq!(l.run.cycle_base_pct, None);
     let (_, changed) = run_set(&mut l, &c, "batch_size", "3").unwrap();
     assert!(!changed);
+    assert_eq!(l.run.herd_window_min, 30);
+    run_set(&mut l, &c, "herd-window-min", "45").unwrap();
+    assert_eq!(l.run.herd_window_min, 45);
     for (k, v) in [
+        ("herd_window_min", "0"),
+        ("herd_window_min", "1441"),
+        ("cycle_started_at", "2026-11-15T14:00:00-08:00"),
         ("arm_at_pct", "0"),
         ("arm_at_pct", "101"),
         ("max_concurrent", "0"),
@@ -779,8 +845,10 @@ fn new_night_resets_the_counters() {
     l.run.wake_cycles = 3;
     l.run.herd_tripped = true;
     l.run.cycle_base_pct = Some(50);
+    l.run.cycle_started_at = Some("2026-11-16T03:34:00-08:00".into());
     new_night(&mut l, &ctx("2026-11-16T09:00:00-08:00")).unwrap();
     assert_eq!((l.run.wake_cycles, l.run.herd_tripped, l.run.cycle_base_pct, l.agents[0].resumes_tonight), (0, false, None, 0));
+    assert_eq!(l.run.cycle_started_at, None);
 }
 
 #[test]

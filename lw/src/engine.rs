@@ -533,6 +533,7 @@ pub fn next(l: &mut Ledger, ctx: &Ctx, token: &str, u: &Usage, sizes: &dyn Fn(&A
     if reason == Reason::Wall {
         l.run.wake_cycles += 1;
         l.run.cycle_base_pct = Some(u.five_pct);
+        l.run.cycle_started_at = Some(ctx.now_str());
     }
     log(l, ctx, format!("wake {token} ({}) handled at {}", word(&reason), usage_text(u)));
 
@@ -604,10 +605,19 @@ pub fn next(l: &mut Ledger, ctx: &Ctx, token: &str, u: &Usage, sizes: &dyn Fn(&A
         ));
     }
 
-    // 5. Herd guard.
+    // 5. Herd guard. The rise check is for a resume burst right after the wall wake, so it applies only within
+    // `herd_window_min` of it. Later in a long cycle, ordinary work raises usage: a batch wake re-bases instead of comparing.
+    // A ledger without `cycle_started_at` (written before it existed) counts as past the window.
+    let in_window = l
+        .run
+        .cycle_started_at
+        .as_deref()
+        .and_then(|s| stored(ctx, s))
+        .is_some_and(|started| ctx.now - started < Duration::minutes(i64::from(l.run.herd_window_min)));
     let herd = if l.run.herd_tripped {
         Some("a resumed agent failed on the limit again".to_string())
-    } else if let Some(base) = l.run.cycle_base_pct
+    } else if in_window
+        && let Some(base) = l.run.cycle_base_pct
         && u.five_pct > base.saturating_add(l.run.herd_rise_pct)
     {
         Some(format!("5-hour usage rose from {base}% to {}% since the wake (more than {} points)", u.five_pct, l.run.herd_rise_pct))
@@ -618,6 +628,11 @@ pub fn next(l: &mut Ledger, ctx: &Ctx, token: &str, u: &Usage, sizes: &dyn Fn(&A
     };
     if let Some(r) = herd {
         return Ok((herd_stop(l, ctx, r), true));
+    }
+    if reason == Reason::Batch && !in_window && l.run.cycle_base_pct != Some(u.five_pct) {
+        let from = l.run.cycle_base_pct.map(|b| format!("{b}%")).unwrap_or_else(|| "none".into());
+        l.run.cycle_base_pct = Some(u.five_pct);
+        log(l, ctx, format!("past the {} min herd window: cycle base {from} -> {}%", l.run.herd_window_min, u.five_pct));
     }
 
     // 6. Agents a person must decide on.
@@ -692,22 +707,22 @@ pub fn next(l: &mut Ledger, ctx: &Ctx, token: &str, u: &Usage, sizes: &dyn Fn(&A
         }
         (Value::Null, take_timers(l))
     };
-    let mut toast = if batch.is_empty() {
-        format!("No room to resume: {running} running (max {}).", l.run.max_concurrent)
+    // An empty batch resumed nothing: no toast (it would only be noise). `waiting_for_room` and `needs_human` still say why.
+    let toast = if batch.is_empty() {
+        Value::Null
     } else {
-        format!("Resumed {}: {}.", batch.len(), names(&batch))
+        let mut t = format!("Resumed {}: {}.", batch.len(), names(&batch));
+        if remaining > 0 {
+            t.push_str(&format!(
+                " {remaining} waiting; next batch at {}.",
+                arm["wake_at"].as_str().and_then(|s| stored(ctx, s)).map(|t| ctx.hm(t)).unwrap_or_default()
+            ));
+        }
+        if !needs_human.is_empty() {
+            t.push_str(&format!(" Needs you: {}.", names(&needs_human)));
+        }
+        json!(t)
     };
-    if waiting_for_room > 0 {
-        toast.push_str(&format!(" {waiting_for_room} waiting; they resume after an agent finishes."));
-    } else if remaining > 0 {
-        toast.push_str(&format!(
-            " {remaining} waiting; next batch at {}.",
-            arm["wake_at"].as_str().and_then(|s| stored(ctx, s)).map(|t| ctx.hm(t)).unwrap_or_default()
-        ));
-    }
-    if !needs_human.is_empty() {
-        toast.push_str(&format!(" Needs you: {}.", names(&needs_human)));
-    }
     Ok((
         json!({
             "action": "resume", "batch": batch, "needs_human": needs_human, "remaining": remaining, "waiting_for_room": waiting_for_room,
@@ -777,7 +792,7 @@ fn parse_num(v: &str, min: u64, max: u64) -> Result<u64, String> {
     Ok(n)
 }
 
-pub const RUN_KEYS: &str = "unattended, max_concurrent, batch_size, batch_gap_min, max_wake_cycles, wake_cycles, max_resumes_per_agent, arm_at_pct, herd_rise_pct, herd_refail_min, weekly_stop_pct, redispatch_over_bytes, resume_after_weekly, cycle_base_pct, herd_tripped";
+pub const RUN_KEYS: &str = "unattended, max_concurrent, batch_size, batch_gap_min, max_wake_cycles, wake_cycles, max_resumes_per_agent, arm_at_pct, herd_rise_pct, herd_refail_min, herd_window_min, weekly_stop_pct, redispatch_over_bytes, resume_after_weekly, cycle_base_pct, herd_tripped";
 
 pub fn run_set(l: &mut Ledger, ctx: &Ctx, key: &str, value: &str) -> Out {
     let key = key.trim().replace('-', "_");
@@ -798,12 +813,13 @@ pub fn run_set(l: &mut Ledger, ctx: &Ctx, key: &str, value: &str) -> Out {
             "arm_at_pct" => r.arm_at_pct = n32(1, 100)?,
             "herd_rise_pct" => r.herd_rise_pct = n32(1, 100)?,
             "herd_refail_min" => r.herd_refail_min = n32(0, 1440)?,
+            "herd_window_min" => r.herd_window_min = n32(1, 1440)?,
             "weekly_stop_pct" => r.weekly_stop_pct = n32(1, 100)?,
             "redispatch_over_bytes" => r.redispatch_over_bytes = parse_num(value, 1, u64::MAX)?,
             "cycle_base_pct" => {
                 r.cycle_base_pct = if matches!(value.trim().to_ascii_lowercase().as_str(), "null" | "none" | "") { None } else { Some(n32(0, 1000)?) }
             }
-            "wake_seq" => return Err("wake_seq is kept by lw itself".into()),
+            "wake_seq" | "cycle_started_at" => return Err(format!("{key} is kept by lw itself")),
             _ => return Err(format!("unknown run key {key:?}; one of: {RUN_KEYS}")),
         }
         Ok(())
@@ -821,6 +837,7 @@ pub fn run_set(l: &mut Ledger, ctx: &Ctx, key: &str, value: &str) -> Out {
 pub fn new_night(l: &mut Ledger, ctx: &Ctx) -> Out {
     l.run.wake_cycles = 0;
     l.run.cycle_base_pct = None;
+    l.run.cycle_started_at = None;
     l.run.herd_tripped = false;
     for a in &mut l.agents {
         a.resumes_tonight = 0;
@@ -902,11 +919,12 @@ pub fn summary(l: &Ledger, path: &str) -> String {
         if r.resume_after_weekly { " (resumes after weekly)" } else { "" }
     ));
     o.push_str(&format!(
-        "guard    wake cycles {}/{}; rise > {} pts{}; refail < {} min; {} resumes per agent; redispatch over {} bytes; tripped: {}\n",
+        "guard    wake cycles {}/{}; rise > {} pts{} within {} min of the wall wake; refail < {} min; {} resumes per agent; redispatch over {} bytes; tripped: {}\n",
         r.wake_cycles,
         r.max_wake_cycles,
         r.herd_rise_pct,
         r.cycle_base_pct.map(|b| format!(" from {b}%")).unwrap_or_default(),
+        r.herd_window_min,
         r.herd_refail_min,
         r.max_resumes_per_agent,
         r.redispatch_over_bytes,

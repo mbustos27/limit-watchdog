@@ -493,8 +493,11 @@ fn run_set_and_log_go_through() {
     e.ok(T0, &["init"]);
     let r = e.ok(T0, &["run-set", "max-concurrent", "3"]);
     assert_eq!((r["from"].as_u64(), r["value"].as_u64()), (Some(4), Some(3)));
+    let r = e.ok(T0, &["run-set", "herd-window-min", "45"]);
+    assert_eq!((r["from"].as_u64(), r["value"].as_u64()), (Some(30), Some(45)));
     e.ok(T0, &["log", "hello", "there"]);
     let l = e.read_ledger();
     assert_eq!(l["run"]["max_concurrent"], 3);
+    assert_eq!(l["run"]["herd_window_min"], 45);
     assert_eq!(l["log"].as_array().unwrap().last().unwrap()["msg"], "hello there");
 }
