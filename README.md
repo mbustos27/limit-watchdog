@@ -109,8 +109,9 @@ All tested on Windows 11 with the desktop app, 2026-11-15:
 | That backup task's `send_message` wakes an orchestrator running in **Bypass** mode | **No.** A Bypass session holds messages from a sender in another mode for approval, and a desktop session doesn't show that prompt. The task fell back to its toast as designed. So with a Bypass orchestrator the backup is a durable *notifier* ("work did not resume, open the session"), not a waker |
 | First real use: 8 paused streams queued, woken right after a 5-hour reset, resumed in batches of two up to 4 at once, large transcripts restarted fresh from their handoff notes | Yes |
 
+| First real 5-hour limit with the `env` block set (hit about 17:40, reset 20:30): do running agents wait instead of failing? | **Yes.** No agent failed. Two agents were mid-work at the wall, and their next reports arrived at 20:30:15, right after the reset. The orchestrator's own turn waited too |
+
 **Not yet proven:**
-- that subagents actually wait out a real 5-hour limit with the env block set
 - the weekly path, live
 - a backup task that can wake a Bypass orchestrator. The candidate is a task saved in Bypass mode, created in a turn the user typed and re-pointed at each arm with `update_scheduled_task`, if updates keep the mode.
 
